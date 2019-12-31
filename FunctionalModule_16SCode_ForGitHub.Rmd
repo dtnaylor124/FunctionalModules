@@ -1,0 +1,2424 @@
+---
+title: "16S Code for Functional Module Paper"
+author: "Dan Naylor"
+date: "12/31/2019"
+output: html_document
+---
+
+Background: in this project, we were analyzing the possibility of breaking the complex soil
+microbiome down into reduced complexity subsets, through targeted enrichments of soil microbes into
+what we referred to as 'functional module' communities. These communities enriched for microbes inhabiting a 
+particular metabolic niche. These specific niches were designed around various processes including microbes
+capable of using simple carbon substrates, more complex polysaccharides, resisting antibiotic stress,
+utilizing alternative electron acceptors to oxygen, or withstanding a number of stresses or other
+alternative growing conditions. This code looks at the trends in the dataset, specifically
+attempting to address three hypotheses:
+
+1) Functional module consortia are reduced in complexity (i.e. lower diversity) than control soil.
+
+2) Functional module consortia are predictable and reproducible (for community composition).
+
+3) Collectively, functional module consortia reflect a significant percentage of control soil diversity
+while also enriching for microbes that would be undetectable, perhaps below the threshold of detection,
+in the starting control soil community.
+
+# Setup:
+
+```{r setup-checkpoint, results='hide', warning=F}
+
+#############################################################################
+### Loading all of the R packages that we will be using in this analysis. ###
+#############################################################################
+
+library("knitr")
+library("rmarkdown")
+library("ggplot2")
+library("reshape2")
+library("ggrepel")
+library("RColorBrewer")
+library("viridis")
+library("vegan")
+library("betapart")
+library("multcomp")
+library("tidyr")
+library("broom")
+library("dplyr")
+library("ztable")
+library("cowplot")
+library("VennDiagram")
+library("ggsci")
+library("gplots")
+library("eulerr")
+library("agricolae")
+library("labdsv")
+library("colorspace")
+library('pairwiseAdonis')
+library('phyloseq')
+library('energy')
+library('colorspace')
+library('scales')
+library('spaa')
+library('igraph')
+
+theme_set(theme_bw() + theme(strip.background = element_blank()))
+
+set.seed(711)
+knitr::opts_chunk$set(cache=TRUE)
+
+```
+
+## 0) Setting up all datasets.
+
+# 0.1) Loading the previously-generated biom and tax files.
+
+This project will collect 16s amplicon data sets generated for the functional modules (3 separate sequencing runs, processed together by Hundo).
+
+```{r 0.1-importdata-makemetadata, eval = T}
+
+# Setting the working directory. (Note: change this to whatever your working directory is)
+setwd("/Users/nayl574/Google Drive/SSFA_FY18_Consortia/amplicon-analysis/2019_07_31_danfunctionalmodules_OTUs/111119_draft2/")
+
+############################################################################################################
+### Importing all 16s data necessary to make a phyloseq object and adding in metadata and factor levels. ###
+############################################################################################################
+
+# Import the biom and tax information for the 16s data. Modify the extensions appropriately to where you store your data.
+no_meta.16s <- import_biom("raw_data/OTU.biom", "raw_data/OTU.tree")
+
+# Import the metadata.
+metadatatable.16s <- import_qiime_sample_data("raw_data/OTU_metadata.txt")
+metadatatable.16s$X <- NULL # The import function gives an extra column that should be rownames.
+# The above function doesn't give you the option to specify rownames, so you have to edit those out manually.
+
+# Merge these to create one phyloseq object.
+unrar.16s <- merge_phyloseq(no_meta.16s, metadatatable.16s)
+
+
+###########################################################################################
+### Making some minor modifications to this dataset to exclude some extraneous samples. ###
+###########################################################################################
+
+# 'Early benomyl' samples were extraneous to this dataset. We only need the late samples.
+unrar.16s <- subset_samples(unrar.16s, !grepl("BEN_EARLY", rownames(sample_data(unrar.16s))))
+
+# 'Tetracycline' had too low of sample counts to be usable. Our rule was if any samples have 3 or more
+# replicates below the rarefaction threshold, we'd get rid of them, as we want at least 3 of the 5 total
+# replicates to be usable in the downstream analysis.
+unrar.16s <- subset_samples(unrar.16s, !grepl("tetracycline", rownames(sample_data(unrar.16s))))
+
+# Similarly, 'glyoxylate' had 3 samples below the rarefaction threshold, so I'm getting rid of them here.
+unrar.16s <- subset_samples(unrar.16s, !grepl("glyoxylate", rownames(sample_data(unrar.16s))))
+
+
+#################################################################################################
+### Subsetting to include up to 5 replicates with the highest values for Shannon's diversity. ###
+#################################################################################################
+
+# Note: for a few modules, we prepared 6 or more replicates to have extras just in case, as we 
+# wanted to have at least 5 replicates for as many modules as possible, and it might have
+# transpired that some replicates would have been excluded due to poor quality or too low of 
+# readcounts per sample. What this means is that we have uneven replicate numbers per module -
+# so, we are going to make sure we have a maximum of 5 replicates for each module, choosing only
+# the 5 replicates that have the highest values for Shannon's diversity.
+
+# Make a dummy phyloseq object - we have to rarefy for Shannon's diversity to work correctly.
+testrar.16s <- rarefy_even_depth(unrar.16s, rngseed = 711, sample.size = 8000)
+df.topdiv <- cbind(dplyr::select(sample_data(testrar.16s), ModuleName, ModuleNameRep),
+                   Shannons = estimate_richness(testrar.16s, measures = c("Shannon")))
+
+df.topdiv <- data.table::data.table(df.topdiv, key = "ModuleName", keep.rownames = TRUE)
+
+# Order by ModuleName then by Shannon in descending order.
+df.topdiv <- df.topdiv[order(ModuleName, -Shannon),]
+
+# Create a dataframe with just the top 5 values for Shannon by ModuleName.
+df.top5div <- df.topdiv[, head(.SD, 5), by = ModuleName]
+
+# Testing to see how many modules are left with fewer than 5 reps.
+table(df.top5div$ModuleName) %>% as.data.frame() %>% subset(., Freq < 5)
+# ^ There are 4 modules with 4 reps and one with 3. Given that this is based on the rarefied
+# dataset, this indicates that after rarefaction the vast majority of our modules should still have
+# 5 replicates.
+
+# Now subset the phyloseq object so it just has the top 5 replicates for Shannon's diversity.
+unrar.16s <- subset_samples(unrar.16s, ModuleNameRep %in% df.top5div$ModuleNameRep)
+
+######################################################
+### Processing the sample data for downstream use. ###
+######################################################
+
+# Converting all variables to character variables (even Replicate).
+sample_data(unrar.16s)[, ] <- lapply(sample_data(unrar.16s)[, ], as.character)
+
+# Adding in factor levels.
+sample_data(unrar.16s)$Replicate <- factor(sample_data(unrar.16s)$Replicate, levels = sort(unique(sample_data(unrar.16s)$Replicate)))
+sample_data(unrar.16s)$Category <- factor(sample_data(unrar.16s)$Category, levels = c("Soil", "Simple Substrates", "Antibiotics", "Polysaccharides",
+                                                                                  "Anaerobic", "Stresses"))
+sample_data(unrar.16s)$Stress <- factor(sample_data(unrar.16s)$Stress, levels = c("control", "2,4-D", "late", "PEG", "pH6", "pH8", "light",
+                                                        "10%C", "heat", "salt"))
+
+
+# Adding in taxonomic levels.
+colnames(tax_table(unrar.16s)) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+# Rarefy samples.
+rardepth <- 8000 # Note: we'll be referring back to this number later, so keep it in mind.
+rar.16s <- rarefy_even_depth(unrar.16s, rngseed = 711, sample.size = rardepth)
+rar.16s # <- This is the full dataset. We're rarefying to 8000, which will end up eliminating some reps.
+
+## We are left with a phyloseq data object encompassing 324 samples and 2542 taxa.
+
+```
+
+
+
+## 1) Ordination.
+
+# 1.1) Investigating how samples group over the entire dataset.
+
+This code block contains the code necessary to generate
+- Figure 1
+
+```{r 1.1-ordination, fig.height = 8, fig.width = 10}
+
+##################################################################################
+### Creating a data object that we can use to make a sample-to-sample heatmap. ###
+##################################################################################
+
+# This figure is a heatmap that shows the dissimilarity (for beta-diversity) between pairs
+# of samples as a panel. Using this approach rather than an ordination plot as there are too many
+# samples for trends to be easily visible on an ordination plot.
+
+# Going to use weighted Unifrac as a distance object, considering that it is possible that there are taxonomic
+# trends for what is being enriched and we want to take into account phylogenetic relatedness when constructing
+# our distance objects. 
+
+# Regenerate the weighted unifrac distance matrix and the full_metadata object.
+wunifrac.matrix <- UniFrac(rar.16s, weighted=TRUE, normalized=TRUE, parallel=FALSE, fast=TRUE) %>% as.matrix %>% 
+  reshape2::melt(varnames = c("one", "two"))
+full_metadata <- data.frame(sample_data(rar.16s))
+
+# Edit the wunifrac matrix object to include the metadata we just obtained, which will be used for faceting.
+for(i in 1:nrow(wunifrac.matrix)){
+  
+  if(i%%1000 == 0){
+    print(i) # Used to track progress, there are about 104000 rows in this matrix.
+  }
+  
+  one <- as.character(wunifrac.matrix$one[i])
+  two <- as.character(wunifrac.matrix$two[i])
+  
+  wunifrac.matrix$Category1[i] <- (as.character(full_metadata[rownames(full_metadata) == one, names(full_metadata) == "Category"]))
+  wunifrac.matrix$ModuleName1[i] <- (as.character(full_metadata[rownames(full_metadata) == one, names(full_metadata) == "ModuleName"]))
+  wunifrac.matrix$Stress1[i] <- (as.character(full_metadata[rownames(full_metadata) == one, names(full_metadata) == "Stress"]))
+  wunifrac.matrix$Substrate1[i] <- (as.character(full_metadata[rownames(full_metadata) == one, names(full_metadata) == "Substrate"]))
+
+  wunifrac.matrix$Category2[i] <- (as.character(full_metadata[rownames(full_metadata) == two, names(full_metadata) == "Category"]))
+  wunifrac.matrix$ModuleName2[i] <- (as.character(full_metadata[rownames(full_metadata) == two, names(full_metadata) == "ModuleName"]))
+  wunifrac.matrix$Stress2[i] <- (as.character(full_metadata[rownames(full_metadata) == two, names(full_metadata) == "Stress"]))
+  wunifrac.matrix$Substrate2[i] <- (as.character(full_metadata[rownames(full_metadata) == two, names(full_metadata) == "Substrate"]))
+}
+
+
+# Relevel the 'Category' variable.
+wunifrac.matrix$Category1 <- factor(wunifrac.matrix$Category1, levels = c("Soil", "Simple Substrates", "Antibiotics", "Polysaccharides",
+                                                                          "Anaerobic", "Stresses"))
+wunifrac.matrix$Category2 <- factor(wunifrac.matrix$Category2, levels = c("Soil", "Simple Substrates", "Antibiotics", "Polysaccharides",
+                                                                          "Anaerobic", "Stresses"))
+
+# Reorder the full_metadata object to be in the order we want modules to appear on the heatmap.
+full_metadata <- with(full_metadata, full_metadata[order(Category, Stress, Substrate),])
+modlist <- unique(full_metadata$ModuleName)
+
+# Now, relevel the ModuleName variables on the wunifrac.matrix object.
+wunifrac.matrix$ModuleName1 <- factor(wunifrac.matrix$ModuleName1, levels = modlist)
+wunifrac.matrix$ModuleName2 <- factor(wunifrac.matrix$ModuleName2, levels = modlist)
+
+colnames(wunifrac.matrix)[colnames(wunifrac.matrix) == "value"] <- "Weighted_Unifrac_Distance"
+
+  ###############
+  ## Figure 1. ##
+  ###############
+
+figure_1 <- ggplot(data = wunifrac.matrix, aes(ModuleName1, ModuleName2)) + 
+  geom_tile(aes(fill = Weighted_Unifrac_Distance), colour = "white") +
+  scale_fill_gradient2(low = "blue", mid="white", high="red", midpoint = 0.35)+
+  # scale_fill_gradientn(colours = terrain.colors(7))+
+  theme(axis.text.x=element_text(size=14,color="black",angle=90), 
+        axis.text.y=element_text(size=14,color="black"), axis.title=element_text(size=11,face="bold"),text=element_text(size=11),
+        axis.title.x = element_blank(), axis.title.y = element_blank(),
+        plot.title = element_blank()) + 
+  geom_hline(yintercept = 0.5, color = "black", size = 0.5) +
+  geom_hline(yintercept = 1.5, color = "black", size = 2) + 
+  geom_hline(yintercept = 19.5, color = "black", size = 2) +
+  geom_hline(yintercept = 25.5, color = "black", size = 2) +
+  geom_hline(yintercept = 32.5, color = "black", size = 2) +
+  geom_hline(yintercept = 37.5, color = "black", size = 2) +
+  geom_hline(yintercept = 66.5, color = "black", size = 0.5) +
+  geom_vline(xintercept = 0.5, color = "black", size = 0.5) +
+  geom_vline(xintercept = 1.5, color = "black", size = 2) + 
+  geom_vline(xintercept = 19.5, color = "black", size = 2) +
+  geom_vline(xintercept = 25.5, color = "black", size = 2) +
+  geom_vline(xintercept = 32.5, color = "black", size = 2) +
+  geom_vline(xintercept = 37.5, color = "black", size = 2) +
+  geom_vline(xintercept = 66.5, color = "black", size = 0.5) +
+  ggtitle("Heatmap of Weighted Unifrac Distances between Modules\n") +
+  theme(legend.key.size = unit(2, "cm"), legend.text = element_text(size = 20),
+        legend.title = element_text(size = 20))
+
+figure_1 <- plot_grid(figure_1)
+figure_1
+
+# Save the plot to be wherever you are storing your final_figures.
+# save_plot("final_figures/Figure_1.pdf", plot = figure_1, ncol = 1, base_width = 18, base_height = 16, scale = 1.5)
+
+
+```
+
+# 1.2) PERMANOVA for significance of experimental factors for Weighted Unifrac across full dataset.
+
+This code block includes all the code necessary to generate:
+- Supplemental Table 1
+
+```{r 1.2-permanova-wunifrac-full-dataset, eval = T}
+
+#######################################################################
+### Analyzing significance of experimental factors using PERMANOVA. ###
+#######################################################################
+
+# Generate a metadata table to be used within the adonis() function.
+wunifrac_metadata <- data.frame(sample_data(rar.16s))
+
+# The UniFrac() function is part of the phyloseq package. It is a generic function that can calculate all forms of
+# UniFrac distance (e.g. weighted or unweighted) on a phyloseq object. Calculate weighted Unifrac for our full dataset.
+wunifrac_distance <- UniFrac(rar.16s, weighted=TRUE, normalized=TRUE, parallel=FALSE, fast=TRUE)
+
+  ###########################
+  ## Supplemental Table 1. ##
+  ###########################
+
+# Testing to see if Category (and Replicate) are significant. 'Category' referring to whether
+# our data is from Soil, Simple Substrates, Anaerobic, Antibiotics, Polysaccharides, or Stresses.
+wunifrac_permanova <- adonis(wunifrac_distance ~ Category + Replicate, data = wunifrac_metadata)
+# wunifrac_permanova$aov.tab %>% View()
+
+# Also testing to see if the individual module name is a significant factor.
+wunifrac_permanova <- adonis(wunifrac_distance ~ ModuleName + Replicate, data = wunifrac_metadata)
+# wunifrac_permanova$aov.tab %>% View()
+
+  ## CONCLUSION => both 'Category' and 'ModuleName' are significant in explaining 
+  ## distance for weighted Unifrac.
+
+####################################################################
+### Analyzing significance of experimental factors using ANOSIM. ###
+####################################################################
+
+# AnoSim is more appropriate if you have unequal sample sizes. I don't necessarily - I have 5 replicates
+# for almost all modules, 3-4 for a handful that didn't pass the rarefaction threshold - but I'm going to check regardless.
+# anosim(wunifrac_distance, wunifrac_metadata$Category) # Significant (p < 0.05) at 0.001.
+# anosim(wunifrac_distance, wunifrac_metadata$ModuleName) # Significant (p < 0.05) at 0.001.
+# anosim(wunifrac_distance, wunifrac_metadata$Replicate) # Significant (p < 0.05) at 0.006.
+
+  ## CONCLUSION => Both Category and ModuleName (and Replicate) are significant
+  ## by ANOSIM analysis as well.
+
+```
+
+# 1.3) PERMANOVA for significance of experimental factors in stress subset.
+
+We want to investigate the effects of 'Stress' or 'Substrate' in the 16S dataset
+specific for stresses. Also the interaction term of 'Stress*Substrate'.
+
+This code block includes the code necessary to generate:
+- Supplemental Table 11
+- Figure 4A
+
+```{r 1.3-stress-ordination, fig.height = 4, fig.width = 6, eval = T}
+
+# Subset the original unrarefied phyloseq object to just the relevant stress samples.
+
+# Note: we had preliminary tests for putative stress modules that weren't included for the subsequent
+# in-depth stress analysis. These preliminary tests resulted in some samples that are not relevant
+# for looking at the stresses, including testing glucose (pH6, pH8, and salt stresses) and any pH6 tests.
+# We're getting rid of these by removing the glucose 'stress' modules as well as the pH 6 modules.
+# Also getting rid of one module that was the herbicide 2,4-D alone, with no additional carbon substrate.
+stress.16s <- subset_samples(unrar.16s, !is.na(Stress) & Substrate != "glucose" & Stress != "pH6" & Substrate != "2,4-D")
+
+# Rarefy the dataset to the same depth used for the full dataset.
+rar.stress.16s <- rarefy_even_depth(stress.16s, rngseed = 711, sample.size = rardepth)
+rar.stress.16s
+
+# Relevel the factor 'Substrate'.
+sample_data(rar.stress.16s)$Substrate <- factor(sample_data(rar.stress.16s)$Substrate, levels = c("n-acetylglucosamine", "xylose", "xylan"))
+
+# Make the ordination objects.
+stress.wunifrac.16s <- ordinate(rar.stress.16s, method = "PCoA", distance = "wunifrac")
+
+# Make a color palette for the various stress levels.
+stress_palette <- c("gray34", viridis(7))
+
+############################################################
+### Generating an ordination plot for the stress subset. ###
+############################################################
+  
+  ################
+  ## Figure 4A. ##
+  ################
+
+stress.pcoa.wunifrac <- plot_ordination(rar.stress.16s, stress.wunifrac.16s, color = "Stress",
+                                        shape = "Substrate", title = "PCoA of Weighted Unifrac Distances for Stress Modules\n") +
+  geom_point(size = 4, color = "black") + 
+  scale_color_manual(values = c("gray34", brewer.pal(7, "Spectral"), "purple3")) + geom_point(size = 3.5, inherit.aes = TRUE) +
+  theme(legend.text = element_text(size = 14), plot.title = element_blank(), axis.title = element_text(size = 18))
+
+stress.pcoa.wunifrac
+
+# ggsave(filename = "final_figures/Figure_4a.pdf", plot = stress.pcoa.wunifrac, height = 6, width = 11)
+
+
+#####################################################################################
+### Analyzing signficance of factors within the stress subset, through PERMANOVA. ###
+#####################################################################################
+
+  ############################
+  ## Supplemental Table 11. ##
+  ############################
+
+# Trying to perform adonis using weighted unifrac.
+stress.wunifrac_metadata <- data.frame(sample_data(rar.stress.16s))
+
+# The UniFrac() function is part of the phyloseq package. It is a generic function that can calculate all forms of
+# UniFrac distance (e.g. weighted or unweighted) on a phyloseq object.
+stress.wunifrac_distance <- UniFrac(rar.stress.16s, weighted=TRUE, normalized=TRUE, parallel=FALSE, fast=TRUE)
+stress.wunifrac_permanova <- adonis(stress.wunifrac_distance ~ Stress * Substrate + Replicate, data = stress.wunifrac_metadata)
+# stress.wunifrac_permanova$aov.tab %>% data.frame() %>% View() 
+
+  ## CONCLUSION => Both Substrate and Stress are significant. 'Stress' explains ~40% of variance, 'Substrate' ~6.5%,
+  ## and the 'Stress:Substrate' interaction term explains 17% of variance.
+
+# Now check out the significance of ModuleName.
+stress.wunifrac_permanova <- adonis(stress.wunifrac_distance ~ ModuleName + Replicate, data = stress.wunifrac_metadata)
+# stress.wunifrac_permanova$aov.tab %>% data.frame() %>% View()
+
+  ## CONCLUSION => 'ModuleName' (i.e. the individual module within the stress subset) is significant in explaining beta-diversity.
+
+```
+
+# 1.4) Investigating the effects of stress distinguishing between stress and non-stressed control.
+
+An avenue afforded to us by the presence of stress modules within the dataset is to see which
+stress provokes the greatest difference in taxonomic composition relative to the unstressed control
+(difference in this case being Weighted Unifrac distance).
+
+This code block includes the code necessary to generate:
+- Figure 4C
+
+```{r 1.4-distance-between-stressed-and-unstressed, eval = T, fig.height = 3, fig.width = 4}
+
+########################################################################
+### Generating a Weighted Unifrac distance matrix for stress subset. ###
+########################################################################
+
+# The below code creates a dataframe with the pairwise combinations of samples ('one' and 'two')
+# with Weighted Unifrac distance between them ('value').
+stress.wunifrac.matrix <- UniFrac(rar.stress.16s, weighted=TRUE, normalized=TRUE, parallel=FALSE, fast=TRUE) %>% as.matrix %>% 
+  reshape2::melt(varnames = c("one", "two"))
+
+# Remove self-to-self comparisons.
+stress.wunifrac.justself <- subset(stress.wunifrac.matrix, value != 0.00000000)
+
+#############################################
+### Add relevant metadata to this matrix. ###
+#############################################
+
+# Generate a metadata table.
+full_metadata <- data.frame(sample_data(rar.16s))
+
+# Add in the metadata for stress and substrate.
+for(i in 1:nrow(stress.wunifrac.justself)){
+  one <- as.character(stress.wunifrac.justself$one[i])
+  two <- as.character(stress.wunifrac.justself$two[i])
+  
+  stress.wunifrac.justself$Stress1[i] <- (as.character(full_metadata[rownames(full_metadata) == one, names(full_metadata) == "Stress"]))
+  stress.wunifrac.justself$Substrate1[i] <- (as.character(full_metadata[rownames(full_metadata) == one, names(full_metadata) == "Substrate"]))
+  
+  stress.wunifrac.justself$Stress2[i] <- (as.character(full_metadata[rownames(full_metadata) == two, names(full_metadata) == "Stress"]))
+  stress.wunifrac.justself$Substrate2[i] <- (as.character(full_metadata[rownames(full_metadata) == two, names(full_metadata) == "Substrate"]))
+}
+
+# Relevel 'Stress2' so when we facet it, it is in the order we want.
+stress.wunifrac.justself$Stress2 <- factor(stress.wunifrac.justself$Stress2, levels = c("control", "2,4-D", "late", "PEG", "pH8", "light",
+                                                                                        "10%C", "heat", "salt"))
+stress.wunifrac.justself$Substrate2 <- factor(stress.wunifrac.justself$Substrate2, levels = c("n-acetylglucosamine", "xylose", "xylan"))
+
+# Subset so we're only retaining comparisons to a control.
+stress.wunifrac.justself <- subset(stress.wunifrac.justself, stress.wunifrac.justself$Stress1 == "control")
+
+# We want to subset everything to just comparisons between the same substrate, regardless of stresses.
+stress.wunifrac.justself <- subset(stress.wunifrac.justself, stress.wunifrac.justself$Substrate1 == stress.wunifrac.justself$Substrate2)
+
+# # Let's add in a column to the metadata column we just generated to reflect the 'comparison' between the modules.
+stress.wunifrac.justself$Comparison <- paste(stress.wunifrac.justself$Stress1, "<->", stress.wunifrac.justself$Stress2, sep = " ")
+stress.wunifrac.justself <- stress.wunifrac.justself[!duplicated(stress.wunifrac.justself$value),] # <- to remove duplicate comparisons,
+# i.e. comparing 4 to 9 and 9 to 4, now we just do it the once.
+
+  ################
+  ## Figure 4C. ##
+  ################
+
+stress_palette <- c("gray34", brewer.pal(7, "Spectral"), "purple3")
+stress_palette <- c("gray34", viridis(4)[2:4], rev(magma(5)))
+palette_stress <- c("gray34", brewer.pal(8, "YlOrRd"))
+
+wunifracdistance_fromunstressedcontrol <- ggplot(data = stress.wunifrac.justself, aes(x = Substrate2, y = value, fill = Stress2)) + geom_boxplot(alpha = 0.75) +
+  facet_wrap(~ Stress2, scales = "free_x", nrow = 1) +
+  labs(x = "Substrate", y = "Distance") +
+  scale_fill_manual(values = stress_palette) +
+  theme(axis.text.x=element_text(size=12,color="black", angle = 45, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title=element_text(size=16,face="bold"),text=element_text(size=16)) +
+  ggtitle("Weighted Unifrac Distance from Unstressed Control by Stress x Substrate")
+
+wunifracdistance_fromunstressedcontrol
+
+# ggsave("../paperfigs_draft1/wunifracdistancefromunstressedcontrol_bystress.jpg", plot = wunifracdistance_fromunstressedcontrol, width = 13, height = 6)
+
+```
+
+```{r 1.5-figure-4b, eval = T, fig.height = 3, fig.width = 4}
+
+  ################
+  ## Figure 4B. ##
+  ################
+
+wunifrac_stressvsunstressed <- ggplot(data = stress.wunifrac.justself, aes(x = Stress2, y = value, fill = Stress2)) + geom_boxplot(alpha = 0.75) +
+#  facet_wrap(~ Stress2, scales = "free_x", nrow = 1) +
+  labs(x = "Stress", y = "Distance") +
+  scale_fill_manual(values = stress_palette) +
+  theme(axis.text.x=element_text(size=12,color="black", angle = 45, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title=element_text(size=16,face="bold"),text=element_text(size=16)) +
+  ggtitle("Weighted Unifrac Distance of Stress vs Unstressed Control")
+
+wunifrac_stressvsunstressed
+
+# ggsave("../paperfigs_draft1/wunifracdistance_stressvsunstressed.jpg", plot = wunifrac_stressvsunstressed, width = 8, height = 6)
+
+###################################################################################
+### Which comparison has the greatest average distance from unstressed control? ###
+###################################################################################
+
+stress.wunifrac.justself$SubstrateComparison <- as.factor(paste(stress.wunifrac.justself$Substrate2, stress.wunifrac.justself$Comparison, sep = "."))
+
+stress.avgdist <- aggregate(stress.wunifrac.justself$value, by = list(stress.wunifrac.justself$SubstrateComparison), FUN = mean)
+stress.avgdist <- stress.avgdist[order(stress.avgdist$x),]
+# stress.avgdist
+
+  ## CONCLUSION => the least differences are between NAG control and PEG, 2,4, and light.
+  ## The greatest differences are between xylan and 10%C, late, heat; also between NAG and salt.
+
+```
+
+# 1.5) Constructing a figure encompassing stress ordination distances.
+
+The code block below includes the code necessary to fully generate:
+- Figure 4
+
+```{r 1.6-full-figure-4, eval = T, fig.height = 5, fig.width = 10}
+
+###############
+## Figure 4. ##
+###############
+
+stress_palette <- c("gray75", viridis(4)[2:4], rev(magma(5)))
+colnames(stress.wunifrac.justself)[colnames(stress.wunifrac.justself) == "Stress2"] <- "Stress"
+
+
+# Generate all parts of the figure.
+figure_4a <- plot_ordination(rar.stress.16s, stress.wunifrac.16s, color = "Stress", shape = "Substrate",
+                             title = "PCoA of Weighted Unifrac Distances for Stress Modules\n") +
+  geom_point(size = 6, color = "black") + geom_point(size = 5.5, inherit.aes = TRUE) +
+  scale_color_manual(values = stress_palette) +
+  theme(legend.text = element_text(size = 16), legend.title = element_text(size = 18), 
+        plot.title = element_blank(), axis.title = element_text(size = 18, face = "bold"))
+
+figure_4b <- ggplot(data = stress.wunifrac.justself, aes(x = Stress, y = value, fill = Stress)) +
+  geom_boxplot(alpha = 0.75) + labs(x = "Stress", y = "Distance") +
+  scale_fill_manual(values = stress_palette) +
+  theme(axis.text.x=element_text(size=16,color="black", angle = 45, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title=element_text(size=18,face="bold"),text=element_text(size=16), plot.title = element_blank(),
+        legend.text = element_text(size = 16)) +
+  ggtitle("Weighted Unifrac Distance of Stress vs Unstressed Control")
+
+figure_4c <- ggplot(data = stress.wunifrac.justself, aes(x = Substrate2, y = value, fill = Stress)) + geom_boxplot(alpha = 0.75) +
+  facet_wrap(~ Stress, scales = "free_x", nrow = 1) +
+  labs(x = "\nSubstrate", y = "Distance") +
+  scale_fill_manual(values = stress_palette) +
+  theme(axis.text.x=element_text(size=16,color="black", angle = 45, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title=element_text(size=18,face="bold"),text=element_text(size=18), plot.title = element_blank(),
+        legend.text = element_text(size = 16)) +
+  ggtitle("\nWeighted Unifrac Distance from Unstressed Control\nby Stress x Substrate")
+
+figure_4bc <- plot_grid(figure_4b, figure_4c, ncol = 1, labels = c("b)", "c)"), label_size = 24)
+figure_4 <- plot_grid(figure_4a, figure_4bc, ncol = 2, labels = c("a)", ""), label_size = 24, rel_widths = c(1.1, 0.9))
+figure_4
+
+# save_plot("final_figures/Figure_4.pdf", plot = figure_4, ncol = 1, base_width = 20, base_height = 9, scale = 1.5)
+
+```
+
+
+
+## 2) Investigating the first and second hypotheses.
+
+The first hypothesis (functional modules are reduced-complexity) will be investigated with respect
+to alpha-diversity metrics, specifically Shannon's diversity and species richness.
+
+The second hypothesis (functional modules are reproducible and predictable) will be investigated through
+the metric of beta-dispersion for weighted Unifrac distance.
+
+
+# 2.1) Alpha-Diversity Metrics, ANOVA tests for significance.
+
+This code block includes the code necessary to generate:
+- Supplemental Table 2
+- Supplemental Table 3
+
+```{r 2.1-calculating-alpha-diversity-supplementaltable2-supplementaltable3, eval = T}
+
+###################################################################
+### Calculate alpha-diversity metrics from the phyloseq object. ###
+###################################################################
+
+# We're going to get Shannon's (alpha-)diversity and Observed (aka OTU richness),
+# using the estimate_richness function within Phyloseq.
+richness <- estimate_richness(rar.16s, split = TRUE, measures = c("Shannon", "Observed"))
+
+# In order to perform ANOVA to see what factors are significant in explaining alpha-diversity,
+# we need to create a table with everything.
+alpha_table <- cbind(data.frame(sample_data(rar.16s)), richness)
+
+
+#####################################################################################################
+### ANOVA to determine which experimental factors are significant for explaining alpha-diversity. ###
+#####################################################################################################
+
+# Run ANOVA using the aov() function. This takes as arguments the model we want to test
+# (i.e. the dependent variable as a function of other variables) and the dataframe in which
+# all these variables are to be found.
+
+  ###########################
+  ## Supplemental Table 2. ##
+  ###########################
+
+# Start with Shannon's diversity.
+shannon_model <- aov(Shannon ~ Category + Replicate, data = alpha_table)
+# summary(shannon_model)[[1]] %>% View() # Category is significant, Replicate isn't.
+# Taking out soil and repeating.
+alpha_table_nosoil <- subset(alpha_table, Substrate != "soilextract")
+shannon_model <- aov(Shannon ~ Category + Replicate, data = alpha_table_nosoil)
+# summary(shannon_model)[[1]] %>% View() # Category is still significant and Replicate is not.
+
+shannon_model <- aov(Shannon ~ ModuleName + Replicate, data = alpha_table)
+# summary(shannon_model)[[1]] %>% View() # <- ModuleName is significant; Replicate is not.
+shannon_model <- aov(Shannon ~ ModuleName + Replicate, data = alpha_table_nosoil)
+# summary(shannon_model)[[1]] %>% View() # ModuleName is still significant without soil in the dataset.
+
+  ###########################
+  ## Supplemental Table 3. ##
+  ###########################
+
+# And OTU richness.
+richness_model <- aov(Observed ~ Category + Replicate, data = alpha_table)
+# summary(richness_model)[[1]] %>% View() # <- Category is significant. Replicate isn't.
+richness_model <- aov(Observed ~ Category + Replicate, data = alpha_table_nosoil)
+# summary(richness_model)[[1]] %>% View() # <- Category is not significant when you remove soils from the equation.
+
+
+richness_model <- aov(Observed ~ ModuleName + Replicate, data = alpha_table)
+# summary(richness_model)[[1]] %>% View() # <- ModuleName is significant. Replicate isn't.
+richness_model <- aov(Observed ~ ModuleName + Replicate, data = alpha_table_nosoil)
+# summary(richness_model)[[1]] %>% View() # <- ModuleName isn't significant when you remove soils from the equation.
+
+  
+  ## CONCLUSION => Category and ModuleName are significant for explaining Shannon's diversity
+  ## regardless of whether soil is included. For richness, however, neither factor remains significant
+  ## after removing soil from the dataset.
+
+```
+
+# 2.2) Alpha-diversity metrics' normality, and significance through Kruskal-Wallis.
+
+```{r 2.2-alpha-diversity-table-subset-objects, eval = T}
+
+############################################################
+### Melting the alpha table object for downstream usage. ###
+############################################################
+
+alpha_table_melt <- reshape2::melt(alpha_table)
+# View(alpha_table_melt)
+
+names(alpha_table_melt)[names(alpha_table_melt) == "variable"] <- "DiversityMetric"
+alpha_table_melt$DiversityMetric <- factor(alpha_table_melt$DiversityMetric, levels = c("Shannon", "Observed"))
+
+# Make the subsets for each diversity metric that will be used for graphing.
+shannon_melt <- subset(alpha_table_melt, DiversityMetric == "Shannon")
+richness_melt <- subset(alpha_table_melt, DiversityMetric == "Observed")
+
+###################################################################################
+### Testing to see if our alpha-diversity metrics follow a normal distribution. ###
+###################################################################################
+
+# This is because ANOVA, general linear models, and t-tests require some degree of normalcy to function properly.
+# Non-normal data should use Kruskal-Wallis, Wilcoxon rank-sum test, or general linear models with another distribution.
+# NEED CLARIFICATION ON THIS
+hist(shannon_melt$value, main="Shannon Diversity", xlab="", breaks=10) # <- Mostly normal aside from a few outliers.
+hist(richness_melt$value, main="Richness", xlab="", breaks=10) # Not especially normal.
+
+# Another option is to run the Shapiro-Wilk test of normality. Note that in this test, the null hypothesis is that the data
+# come from a normal distribution, so a p-value < 0.05 indicates the data is not normal.
+shapiro.test(shannon_melt$value)
+shapiro.test(richness_melt$value)
+
+# Neither of these are normal apparently, so it would be more appropriate for use to use Kruskal-Wallis
+# and Wilcoxon-Rank-Sum tests. Kruskal Wallis is more appropriate for more than two levels. 
+
+##########################################################################################
+### Running Kruskal-Wallis tests to determine if experimental factors are significant. ###
+##########################################################################################
+
+kruskal.test(value ~ Category, data = shannon_melt)
+kruskal.test(value ~ Category, data = richness_melt)
+
+kruskal.test(value ~ ModuleName, data = shannon_melt)
+kruskal.test(value ~ ModuleName, data = richness_melt)
+
+
+# Note that the null hypothesis for Kruskal-Wallis is that the medians for all groups are equal, whereas the alternative
+# hypothesis is that at least one population median for one group is different from the population median(s) for at least one
+# other group.
+
+  ## CONCLUSION => Therefore, the above results show that Category and ModuleName are both
+  ## significant factors for explaining these Shannon's diversity and richness.
+
+```
+
+# 2.3) Tukey's post-hoc tests for alpha-diversity.
+
+This code block includes the code necessary to generate:
+- Supplemental Table 4
+- Supplemental Table 5
+
+```{r 2.3-tukey-alpha-diversity, eval = T, results = 'hide'}
+
+######################################################
+### Tukey's post-hoc tests on Shannon's diversity. ###
+######################################################
+
+# Run the below command to view the average Shannon's values across our different categories.
+tapply(shannon_melt$value, shannon_melt$Category, mean) %>% sort()
+tapply(shannon_melt$value, shannon_melt$Category, median) %>% sort()
+
+  ## CONCLUSION => Soil control has by far the highest Shannon's diversity,
+  ## followed by polysaccharides and then stresses or anaerobic modules.
+
+  #######################################
+  ## Supplemental Table 4 (Shannon's). ##
+  #######################################
+
+# Now make an ANOVA object that will be used for the Tukey's test.
+aov_shannon <- aov(data = shannon_melt, formula = value ~ Category)
+tukey_shannon <- HSD.test(aov_shannon, "Category", group = TRUE)
+# tukey_shannon$groups %>% View()
+
+  ## CONCLUSION => Tukey's test shows that soil control is significantly different from 
+  ## polysaccharides, which in turn is different from every other category.
+
+
+## Do soils affect this? Taking out soils and re-testing.
+shannon_melt_nosoil <- subset(shannon_melt, Substrate != "soilextract")
+aov_shannon <- aov(data = shannon_melt_nosoil, formula = value ~ Category)
+tukey_shannon <- HSD.test(aov_shannon, "Category", group = TRUE)
+# tukey_shannon$groups %>% View() 
+
+  ## CONCLUSION => We see the same results as with soil included;
+  ## polysaccharides group separately from every other category,
+  ## with no other significant differences between categories.
+
+
+###############################################
+### Tukey's post-hoc tests on OTU richness. ###
+###############################################
+
+# Run the below command to view the average richness values across our different categories.
+tapply(richness_melt$value, richness_melt$Category, mean) %>% sort()
+tapply(richness_melt$value, richness_melt$Category, median) %>% sort()
+
+  ## CONCLUSION => Soil control has by far the highest richness,
+  ## followed by polysaccharides/stresses/anaerobic modules.
+  ## (Precise order depends on mean vs. median.)
+
+  ######################################
+  ## Supplemental Table 4 (Richness). ##
+  ######################################
+
+# Now make an ANOVA object that will be used for the Tukey's test.
+aov_richness <- aov(data = richness_melt, formula = value ~ Category)
+tukey_richness <- HSD.test(aov_richness, "Category", group = TRUE)
+# tukey_richness$groups %>% View()
+
+  ## CONCLUSION => Soil groups separately from everything else for richness.
+  ## No other significant differences were found.
+
+
+## Taking out soils and re-testing.
+richness_melt_nosoil <- subset(richness_melt, Substrate != "soilextract")
+aov_richness <- aov(data = richness_melt_nosoil, formula = value ~ Category)
+tukey_richness <- HSD.test(aov_richness, "Category", group = TRUE)
+# tukey_richness$groups %>% View() 
+
+  ## CONCLUSION => Same results as above;
+  ## no significant differences between the non-soil categories.
+
+
+###########################################################
+### Tukey's tests repeated on a module-by-module basis. ###
+###########################################################
+
+sort(tapply(shannon_melt$value, shannon_melt$ModuleName, mean)) %>% sort()
+sort(tapply(shannon_melt$value, shannon_melt$ModuleName, median)) %>% sort()
+
+  ## CONCLUSION => Soil control has by far the highest Shannon's diversity,
+  ## followed by various stress or polysaccharide modules.
+
+  #######################################
+  ## Supplemental Table 5 (Shannon's). ##
+  #######################################
+
+# Now make an ANOVA object that will be used for the Tukey's test.
+aov_shannon <- aov(data = shannon_melt, formula = value ~ ModuleName)
+tukey_shannon <- HSD.test(aov_shannon, "ModuleName", group = TRUE)
+# tukey_shannon$groups %>% View()
+
+  ## CONCLUSION => There are a number of modules within the stress and polysaccharide categories
+  ## that do not differ statistically from soil control for Shannon's diversity.
+
+sort(tapply(richness_melt$value, richness_melt$ModuleName, mean)) %>% sort()
+sort(tapply(richness_melt$value, richness_melt$ModuleName, median)) %>% sort()
+
+  ## CONCLUSION => Soil control has by far the highest richness, followed by various
+  ## polysaccharide and stress modules (and streptomycin!).
+
+  ######################################
+  ## Supplemental Table 5 (Richness). ##
+  ######################################
+
+# Now make an ANOVA object that will be used for the Tukey's test.
+aov_richness <- aov(data = richness_melt, formula = value ~ ModuleName)
+tukey_richness <- HSD.test(aov_richness, "ModuleName", group = TRUE)
+# tukey_richness$groups %>% View()
+
+  ## CONCLUSION => There are a couple salt stress modules that are statistically similar
+  ## to soil control, but apart from that most modules are lower and group separately.
+
+```
+
+
+# 2.4) Investigating alpha-diversity trends specifically for the stress modules only.
+
+# Includes code necessary to generate:
+- Supplemental Table 6
+- Supplemental Table 7
+
+```{r 2.4-stress-subset-shannons-diversity, eval = T, results = 'hide'}
+
+###################################################################################
+### Making a dataframe specifically for Shannon's diversity and stress modules. ###
+###################################################################################
+
+# Make separate subsets for stresses.
+shannon_stress <- subset(shannon_melt, Category %in% c("Soil", "Stresses") | ModuleName %in% c("n-acetylglucosamine", "xylose", "xylan"))
+shannon_stress <- subset(shannon_stress, !Substrate %in% c("2,4-D", "glucose"))
+
+# Note: NAG, xylose, and xylan without any stress applied -> in this dataset, they represent the controls.
+shannon_stress[shannon_stress$ModuleName %in% c("n-acetylglucosamine", "xylose", "xylan"), colnames(shannon_stress) == "Stress"] <- "control"
+shannon_stress$Stress <- as.character(shannon_stress$Stress)
+shannon_stress[is.na(shannon_stress$Stress), colnames(shannon_stress) == "Stress"] <- "soil"
+shannon_stress <- subset(shannon_stress, !Stress == "pH6") # <- Represents some residual samples not needed for this comparison.
+shannon_stress$Stress <- factor(shannon_stress$Stress, levels = c("soil", levels(sample_data(rar.16s)$Stress)))
+
+# Reorder the modulename levels in order by stress and substrate.
+shannon_stress$Substrate <- factor(shannon_stress$Substrate, levels = c("soilextract", "n-acetylglucosamine", "xylose", "xylan"))
+shannon_stress <- with(shannon_stress, shannon_stress[order(Category, Stress, Substrate),])
+shannon_stress$ModuleName <- factor(shannon_stress$ModuleName, levels = unique(shannon_stress$ModuleName))
+
+
+###################################################################################
+### Investigating trends for Shannon's diversity values by Stress or Substrate. ###
+###################################################################################
+
+sort(tapply(shannon_stress$value, shannon_stress$Stress, mean, na.rm = TRUE))
+sort(tapply(shannon_stress$value, shannon_stress$Stress, median, na.rm = TRUE))
+
+  ## CONCLUSION => Apart from soil control, the highest Shannon's values for stresses are
+  ## for 10% carbon and late harvesting.
+
+sort(tapply(shannon_stress$value, shannon_stress$Substrate, mean, na.rm = TRUE))
+sort(tapply(shannon_stress$value, shannon_stress$Substrate, median, na.rm = TRUE))
+
+  ## CONCLUSION => Within substrates, the order goes (soil extract ->) xylan ->
+  ## xylose -> NAG.
+
+# Now run ANOVA. Note that to look at the Stress * Substrate effect we should get rid of soil control.
+shannon_stress_nosoil <- subset(shannon_stress, Substrate != "soilextract")
+aov_shannon_stress <- aov(data = shannon_stress_nosoil, formula = value ~ Stress * Substrate)
+
+  ######################################
+  ## Supplemental Table 6 (Shannon's) ##
+  ######################################
+
+aov_shannon_stress <- aov(data = shannon_stress_nosoil, formula = value ~ ModuleName)
+# summary.aov(aov_shannon_stress)[[1]] %>% View() # ModuleName is not highly significant.
+
+  ## CONCLUSION => Both Stress and Substrate are significant in explaining Shannon's diversity,
+  ## Stress far less so than Substrate. However, their interaction is NOT significant. Meanwhile,
+  ## individual ModuleName is barely non-significant factor (p = 0.0661) as analyzed separately.
+
+########################################################################
+### Investigating trends for richness values by Stress or Substrate. ###
+########################################################################
+
+# Make separate subsets for stresses.
+richness_stress <- subset(richness_melt, Category %in% c("Soil", "Stresses") | ModuleName %in% c("n-acetylglucosamine", "xylose", "xylan"))
+richness_stress <- subset(richness_stress, !Substrate %in% c("2,4-D", "glucose"))
+
+# Note: NAG, xylose, and xylan without any stress applied -> in this dataset, they represent the controls.
+richness_stress[richness_stress$ModuleName %in% c("n-acetylglucosamine", "xylose", "xylan"), colnames(richness_stress) == "Stress"] <- "control"
+richness_stress$Stress <- as.character(richness_stress$Stress)
+richness_stress[is.na(richness_stress$Stress), colnames(richness_stress) == "Stress"] <- "soil"
+richness_stress <- subset(richness_stress, !Stress == "pH6") # <- Represents some residual samples not needed for this comparison.
+richness_stress$Stress <- factor(richness_stress$Stress, levels = c("soil", levels(sample_data(rar.16s)$Stress)))
+
+# Reorder the modulename levels in order by stress and substrate.
+richness_stress$Substrate <- factor(richness_stress$Substrate, levels = c("soilextract", "n-acetylglucosamine", "xylose", "xylan"))
+richness_stress <- with(richness_stress, richness_stress[order(Category, Stress, Substrate),])
+richness_stress$ModuleName <- factor(richness_stress$ModuleName, levels = unique(richness_stress$ModuleName))
+
+sort(tapply(richness_stress$value, richness_stress$Stress, mean, na.rm = TRUE))
+sort(tapply(richness_stress$value, richness_stress$Stress, median, na.rm = TRUE))
+
+  ## CONCLUSION => Apart from soil control, the highest richness values for stresses are
+  ## for 10% carbon and late harvesting.
+
+sort(tapply(richness_stress$value, richness_stress$Substrate, mean, na.rm = TRUE))
+sort(tapply(richness_stress$value, richness_stress$Substrate, median, na.rm = TRUE))
+
+  ## CONCLUSION => Within substrates, the order goes (soil extract ->) xylose ->
+  ## xylan -> NAG.
+
+############################################################################
+### Tukey's post-hoc groupings for Shannon's diversity in stress subset. ###
+############################################################################
+
+# Now getting statistically significant differences between soil control and individual stress modules.
+aov_shannon_stress <- aov(data = shannon_stress, formula = value ~ ModuleName)
+tukey_shannon <- HSD.test(aov_shannon_stress, "ModuleName", group = TRUE)
+# tukey_shannon$groups %>% View() # About half of individual stress modules are not statistically different from soil control.
+
+aov_shannon_stress <- aov(data = shannon_stress, formula = value ~ Substrate)
+tukey_shannon <- HSD.test(aov_shannon_stress, "Substrate", group = TRUE)
+# tukey_shannon$groups %>% View() # All substrates are different from soil control.
+
+aov_shannon_stress <- aov(data = shannon_stress, formula = value ~ Stress)
+tukey_shannon <- HSD.test(aov_shannon_stress, "Stress", group = TRUE)
+# tukey_shannon$groups %>% View() # All stresses are different from soil control.
+
+  ## CONCLUSION => Half of individual stress modules are not statistically different from soil control.
+  ## However, when combining by substrates, all are distinguishable from soil,
+  ## and all stresses are different from soil.
+
+  ########################################
+  ## Supplemental Table 7 (Shannon's) ##
+  ########################################
+
+# Removing soil and redoing.
+aov_shannon_stress <- aov(data = shannon_stress_nosoil, formula = value ~ ModuleName)
+tukey_shannon <- HSD.test(aov_shannon_stress, "ModuleName", group = TRUE)
+# tukey_shannon$groups %>% View() # Almost all stresses group with one another.
+
+aov_shannon_stress <- aov(data = shannon_stress_nosoil, formula = value ~ Substrate)
+tukey_shannon <- HSD.test(aov_shannon_stress, "Substrate", group = TRUE)
+# tukey_shannon$groups %>% View() # Xylan and NAG group differently, both group with xylose.
+
+aov_shannon_stress <- aov(data = shannon_stress_nosoil, formula = value ~ Stress)
+tukey_shannon <- HSD.test(aov_shannon_stress, "Stress", group = TRUE)
+# tukey_shannon$groups %>% View() # No stresses are different from one another for Shannon's.
+
+```
+
+
+# 2.5) Investigating richness trends specifically for the stress modules only.
+
+```{r 2.5-stress-subset-richness, eval = T}
+
+########################################################################
+### Making a dataframe specifically for richness and stress modules. ###
+########################################################################
+
+# Make separate subsets for stresses.
+richness_stress <- subset(richness_melt, Category %in% c("Soil", "Stresses") | ModuleName %in% c("n-acetylglucosamine", "xylose", "xylan"))
+richness_stress <- subset(richness_stress, !Substrate %in% c("2,4-D", "glucose"))
+
+# Note: NAG, xylose, and xylan without any stress applied -> in this dataset, they represent the controls.
+richness_stress[richness_stress$ModuleName %in% c("n-acetylglucosamine", "xylose", "xylan"), colnames(richness_stress) == "Stress"] <- "control"
+richness_stress$Stress <- as.character(richness_stress$Stress)
+richness_stress[is.na(richness_stress$Stress), colnames(richness_stress) == "Stress"] <- "soil"
+richness_stress <- subset(richness_stress, !Stress == "pH6") # <- Represents some residual samples not needed for this comparison.
+richness_stress$Stress <- factor(richness_stress$Stress, levels = c("soil", levels(sample_data(rar.16s)$Stress)))
+
+# Reorder the modulename levels in order by stress and substrate.
+richness_stress$Substrate <- factor(richness_stress$Substrate, levels = c("soilextract", "n-acetylglucosamine", "xylose", "xylan"))
+richness_stress <- with(richness_stress, richness_stress[order(Category, Stress, Substrate),])
+richness_stress$ModuleName <- factor(richness_stress$ModuleName, levels = unique(richness_stress$ModuleName))
+
+# Remove soils.
+richness_stress <- subset(richness_stress, Substrate != "soilextract")
+
+########################################################################
+### Investigating trends for richness values by Stress or Substrate. ###
+########################################################################
+
+sort(tapply(richness_stress$value, richness_stress$Stress, mean, na.rm = TRUE))
+sort(tapply(richness_stress$value, richness_stress$Stress, median, na.rm = TRUE))
+
+  ## CONCLUSION => Slightly different results for mean than median. For median, the
+  ## highest stresses are 10%C, late, and pH 8. For mean, the highest stresses are 
+  ## salt, 2,4-D, and 10% C.
+
+sort(tapply(richness_stress$value, richness_stress$Substrate, mean, na.rm = TRUE))
+sort(tapply(richness_stress$value, richness_stress$Substrate, median, na.rm = TRUE))
+
+  ## CONCLUSION => By median, richnesses go xylan -> xylose -> NAG; for mean, they
+  ## go xylose -> xylan -> NAG.
+
+  #####################################
+  ## Supplemental Table 6 (Richness) ##
+  #####################################
+
+# Now run ANOVA. Note that to look at the Stress * Substrate effect we need to get rid of soil control, which we have done.
+aov_richness_stress <- aov(data = richness_stress, formula = value ~ Stress * Substrate)
+# summary(aov_richness_stress)[[1]] %>% View() 
+
+aov_richness_stress <- aov(data = richness_stress, formula = value ~ ModuleName)
+# summary.aov(aov_richness_stress)[[1]] %>% View() # ModuleName is significant.
+
+  ## CONCLUSION => Only Stress, not Substrate, is significant in explaining richness.
+  ## On an individual basis, neither is ModuleName.
+
+
+#################################################################
+### Tukey's post-hoc groupings for richness in stress subset. ###
+#################################################################
+
+# Now getting statistically significant differences between soil control and individual stress modules.
+aov_richness_stress <- aov(data = richness_stress, formula = value ~ ModuleName)
+tukey_richness <- HSD.test(aov_richness_stress, "ModuleName", group = TRUE)
+# tukey_richness$groups %>% View()
+
+aov_richness_stress <- aov(data = richness_stress, formula = value ~ Substrate)
+tukey_richness <- HSD.test(aov_richness_stress, "Substrate", group = TRUE)
+# tukey_richness
+
+aov_richness_stress <- aov(data = richness_stress, formula = value ~ Stress)
+tukey_richness <- HSD.test(aov_richness_stress, "Stress", group = TRUE)
+# tukey_richness
+
+  ## CONCLUSION => About half of individual stress modules are not statistically different
+  ## from soil control. All substrates are different from soil, 
+  ## However, when combining by substrates, all are distinguishable from soil,
+  ## and apart from salt all stresses are different from soil for richness.
+
+  ######################################
+  ## Supplemental Table 7. (Richness) ##
+  ######################################
+
+aov_richness_stress <- aov(data = richness_stress, formula = value ~ ModuleName)
+tukey_richness <- HSD.test(aov_richness_stress, "ModuleName", group = TRUE)
+# tukey_richness$groups %>% View() # Everything groups with each other.
+
+aov_richness_stress <- aov(data = richness_stress, formula = value ~ Substrate)
+tukey_richness <- HSD.test(aov_richness_stress, "Substrate", group = TRUE)
+# tukey_richness$groups %>% View() # All substrates group together even without soil present.
+
+aov_richness_stress <- aov(data = richness_stress, formula = value ~ Stress)
+tukey_richness <- HSD.test(aov_richness_stress, "Stress", group = TRUE)
+# tukey_richness$groups %>% View() # About the only noticeable trend is salt grouping differently from PEG.
+
+```
+
+
+## Beta-dispersion.
+
+# 2.6) Beta-dispersion trends for full dataset.
+
+Here we want to test whether there exist significant differences in variance between our various categories and modules.
+Which categories/modules are more 'reproducible and predictable'? The metric we use for this is 'beta-dispersion', or variance
+within replicates for a given sample type with respect to beta-diversity (here Weighted Unifrac distance). Beta-dispersion
+is Weighted Unifrac distance to the median.
+
+This code blocks includes the code necessary to generate:
+- Supplemental Table 8 (ANOVA and Tukey's)
+
+```{r 2.6-beta-dispersion-wunifrac, eval = T, fig.height = 8, fig.width = 8}
+
+#####################################################
+### Generating a table of beta-dispersion values. ###
+#####################################################
+
+# Start by generating d distance object from the full phyloseq object.
+# Using the UniFrac function within the package 'vegan' to make a distance
+# object based on weighted Unifrac distance.
+wunifrac_distance <- UniFrac(rar.16s, weighted=TRUE, normalized=TRUE, parallel=FALSE, fast=TRUE)
+
+# Get the metadata (we'll need it later).
+wunifrac_metadata <- data.frame(sample_data(rar.16s))
+
+# Calculate beta-dispersion using the 'betadisper' function within 'vegan'.
+disp.mod.wunifrac <- betadisper(wunifrac_distance, wunifrac_metadata$ModuleName)
+# permutest(disp.mod.wunifrac, pairwise = TRUE, permutations = 999) 
+# ^ Note: running this is very time-consuming, but it will get you a comparison of all
+# 60-odd module communities and tell you which are significantly different from one another
+
+dist.tomedian <- data.frame(BetaDisper = disp.mod.wunifrac$distances) # <- The $distances option is a list of the distance to median for every sample.
+
+# We're going to add this into our alpha-diversity table so we can see how dispersion values vary, and
+# to create a graph with alpha-diversity and beta-dispersion values all in one figure, down the line.
+alpha_table <- cbind(alpha_table, BetaDisper = as.numeric(disp.mod.wunifrac$distances))
+
+# Investigate how beta-dispersion varies by module category.
+sort(tapply(alpha_table$BetaDisper, alpha_table$Category, mean, na.rm = TRUE))
+sort(tapply(alpha_table$BetaDisper, alpha_table$Category, median, na.rm = TRUE))
+
+  ## CONCLUSION => Anaerobic > Polysaccharides > Stresses > Soil > Antibiotics > Simple Substrates for beta-dispersion.
+  ## This means that simple substrates have the most reproducible communities,
+  ## whereas polysaccharide and anaerobic modules are the least reproducible.
+
+# Investigate how beta-dispersion varies by individual module.         
+sort(tapply(alpha_table$BetaDisper, alpha_table$ModuleName, mean, na.rm = TRUE))
+sort(tapply(alpha_table$BetaDisper, alpha_table$ModuleName, median, na.rm = TRUE))
+
+  ## CONCLUSION => individual modules with low reproducibility (high beta-dispersion) include
+  ## salt_xylose, 10%C_xylan, pectin, etc.
+
+
+###############################################################################
+### Investigating which exploratory factors explain beta-dispersion values. ###
+###############################################################################
+
+  ###################################
+  ## Supplemental Table 8 (ANOVA). ##
+  ###################################
+
+## Start with the whole dataset for category.
+beta_model <- aov(BetaDisper ~ Category + Replicate, data = alpha_table)
+# summary(beta_model)[[1]] %>% View()
+
+# Taking out soil and repeating.
+alpha_table_nosoil <- subset(alpha_table, Substrate != "soilextract")
+beta_model <- aov(BetaDisper ~ Category + Replicate, data = alpha_table_nosoil)
+# summary(beta_model)
+
+  ## CONCLUSION => Category is significant in explaining beta-dispersion, with or
+  ## without soil control included in the dataset.
+
+## Repeating for 'ModuleName'.
+beta_model <- aov(BetaDisper ~ ModuleName + Replicate, data = alpha_table)
+# summary(beta_model)[[1]] %>% View()
+
+# Taking out soil and repeating.
+#alpha_table_nosoil <- subset(alpha_table, Substrate != "soilextract")
+beta_model <- aov(BetaDisper ~ ModuleName + Replicate, data = alpha_table_nosoil)
+# summary(beta_model)
+
+  ## CONCLUSION => ModuleName is significant for explaining beta-dispersion, with
+  ## or without soil included in the dataset.
+
+
+##################################################################################
+### Tukey's post-hoc tests to see how factor levels group for beta-dispersion. ###
+##################################################################################
+
+  #####################################
+  ## Supplemental Table 8 (Tukey's). ##
+  #####################################
+
+# Tukey's test for Category.
+aov_beta_model <- aov(BetaDisper ~ Category, data = alpha_table)
+tukey_betadisper <- HSD.test(aov_beta_model, "Category", group = TRUE)
+# tukey_betadisper$groups %>% View() 
+
+  ## CONCLUSION => All categories are different (for beta-dispersion) from simple substrates except for antibiotics.
+
+# Tukey's test for ModuleName.
+aov_beta_model <- aov(BetaDisper ~ ModuleName, data = alpha_table)
+tukey_betadisper <- HSD.test(aov_beta_model, "ModuleName", group = TRUE)
+# tukey_betadisper$groups %>% View()
+
+  ## There are five groups total, most module being in at least four; soil is in
+  ## groups 'abcde', so nothing groups separately from it.
+
+
+#############################################################################################
+### Testing to see whether Beta-dispersion covaries with Shannon's diversity or richness. ###
+#############################################################################################
+
+# # Testing the distance correlation method within the package 'energy' to do this.
+# dcor.ttest(alpha_table$Shannon, alpha_table$BetaDisper)
+# dcor.ttest(alpha_table$Observed, alpha_table$BetaDisper)
+# 
+#   ## CONCLUSION => both have a p-value of <2.2e-16, indicating that a significant
+#   ## correlation exists between Shannon's diversity:Beta-dispersion as well as for
+#   ## Richness:Beta-dispersion.
+# 
+# ## Also testing this using Spearman's correlation.
+# corr.shannon <- cor.test(x=alpha_table$BetaDisper, y=alpha_table$Shannon, method = 'spearman')
+# corr.shannon # Significant correlation.
+# corr.richness <- cor.test(x=alpha_table$BetaDisper, y=alpha_table$Observed, method = 'spearman')
+# corr.richness # Significant correlation again.
+# 
+# # And pearson's.
+# corr.shannon <- cor.test(x=alpha_table$BetaDisper, y=alpha_table$Shannon, method = 'pearson')
+# corr.shannon # Significant correlation with Pearson's as well.
+# corr.richness <- cor.test(x=alpha_table$BetaDisper, y=alpha_table$Observed, method = 'pearson')
+# corr.richness # Significant correlation again.
+
+  ## CONCLUSION => Same results as for the dcor.ttest() function.
+
+```
+
+# 2.7) Beta-dispersion test for the stress subset.
+
+This code block includes the code necessary to generate
+- Supplemental Table 9 (both ANOVA and Tukey's sections)
+
+```{r 2.7-beta-dispersion-stresses, eval = T}
+
+###############################################################################################################
+### Generating the stress dataset from alpha table and testing significance of factors for beta-dispersion. ###
+###############################################################################################################
+
+  ###################################
+  ## Supplemental Table 9 (ANOVA). ##
+  ###################################
+
+alpha_table_stress <- subset(alpha_table, Category == "Stresses"  &
+                               !Substrate %in% c("glucose", "2,4-D") &
+                               Stress != "pH6" | ModuleName %in% c("n-acetylglucosamine", "xylose", "xylan"))
+
+beta_model_stress <- aov(BetaDisper ~ Stress * Substrate + Replicate, data = alpha_table_stress)
+# summary(beta_model_stress)[[1]] %>% View()
+beta_model_stress <- aov(BetaDisper ~ ModuleName + Replicate, data = alpha_table_stress)
+# summary(beta_model_stress)[[1]] %>% View() 
+
+  ## CONCLUSION => Stress but not Substrate significant in explaining
+  ## Beta-dispersion; however, the interaction term of Stress * Substrate is NOT significant.
+  ## ModuleName by itself is also significant.
+
+
+#############################################################################################
+### Investigatory analysis of beta-dispersion values by stress, substrate, or modulename. ###
+#############################################################################################
+
+sort(tapply(alpha_table_stress$BetaDisper, alpha_table_stress$Stress, mean, na.rm = TRUE))
+
+  ## CONCLUSION => The most predictable stresses are PEG, 2,4-D, PEG, and pH 8; the least are salt, heat, and 10% C.
+          
+sort(tapply(alpha_table_stress$BetaDisper, alpha_table_stress$Substrate, mean, na.rm = TRUE))
+
+  ## CONCLUSION => Xylan > Xylose > NAG for beta-dispersion.
+
+sort(tapply(alpha_table_stress$BetaDisper, alpha_table_stress$ModuleName, mean, na.rm = TRUE))
+
+  ## CONCLUSION => Salt is high for beta-dispersion.
+
+
+####################################################################################
+### Tukey's post-hoc tests for beta-dispersion groupings by stress or substrate. ###
+####################################################################################
+
+  #####################################
+  ## Supplemental Table 9 (Tukey's). ##
+  #####################################
+
+beta_model_stress <- aov(BetaDisper ~ Stress, data = alpha_table_stress)
+tukey_betadisper_stress <- HSD.test(beta_model_stress, "Stress", group = TRUE)
+# tukey_betadisper_stress$groups %>% View() 
+
+  ## CONCLUSION => Salt and 10%_C group separately from 2,4-D and PEG. No other significant differences.
+
+beta_model_substrate <- aov(BetaDisper ~ Substrate, data = alpha_table_stress)
+tukey_betadisper_substrate <- HSD.test(beta_model_substrate, "Substrate", group = TRUE)
+# tukey_betadisper_substrate$groups %>% View()
+
+  ## CONCLUSION => Xylan and NAG are significantly different from one another, but neither from xylose. ###
+
+beta_model_modulename <- aov(BetaDisper ~ ModuleName, data = alpha_table_stress)
+tukey_betadisper_modulename <- HSD.test(beta_model_modulename, "ModuleName", group = TRUE)
+# tukey_betadisper_modulename$groups %>% View() 
+
+  ## CONCLUSION => salt_xylan groups separately from a bunch of PEG and 2,4-D and other misc stress modules,
+  ## apart from that nothing especially noteworthy.
+
+```
+
+
+# 2.9) Making figures to represent alpha-diversity / beta-dispersion.
+
+This code block includes the code used to generate:
+- Figure 2
+
+```{r 2.9-alpha-diversity-and-beta-dispersion-boxplots, results = 'hide', fig.height = 8, fig.width = 14, eval = T}
+
+  ###############
+  ## Figure 2. ##
+  ###############
+
+# Making a new boxplot with Shannon's diversity, richness, and beta-dispersion as levels.
+alpha_table_melt <- melt(alpha_table, variable.name = "Metric", value.name = "Value")
+alpha_table_melt$Metric <- gsub("Observed", "Richness", alpha_table_melt$Metric) %>%
+  factor(., levels = c("Shannon", "Richness", "BetaDisper"))
+
+# Note: we need to make graphs separately, then use plot_grid to marry them together into one figure.
+shannon_table_melt <- subset(alpha_table_melt, Metric == "Shannon")
+richness_table_melt <- subset(alpha_table_melt, Metric == "Richness")
+betadisper_table_melt <- subset(alpha_table_melt, Metric == "BetaDisper")
+
+
+#########################################################
+### Make the three components to Figure 2 separately. ###
+#########################################################
+
+# Specify a palette for the category levels.
+palette_cat <- c("gray34", "darkgreen", "blue", "brown", "purple", "red")
+
+figure_2a <- ggplot(shannon_table_melt, aes(x = ModuleName, y = Value)) +
+  geom_boxplot(aes(fill = Category)) + coord_cartesian(ylim=c(0, 4)) + # <- This is code to change the y-axis w/o removing effect of outliers on the boxplot.
+  # scale_fill_manual(values = palette_cat) + # Not necessary, we specify it at the end.
+  facet_grid(Metric ~ Category, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=12,color="black",angle=60, hjust = 1),
+        axis.text.y=element_text(size=18,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=24)) + theme(axis.text.x = element_blank()) +
+  ylab("Shannon\n\n") +
+  ggtitle("Diversity / Dispersion Trends for Full Dataset, by Module Name\n") + theme(plot.title = element_blank()) +
+  theme(legend.text = element_text(color = "white"),legend.title = element_text(color = "white"), legend.key = element_rect(fill = "white", color = "white")) + 
+  scale_fill_manual(values = palette_cat, guide = guide_legend(override.aes = list(fill = "white", color = "white", alpha = 1))) 
+# The last two lines of code to make the legend invisible. Doesn't change the figure dimensions!
+
+figure_2b <- ggplot(richness_table_melt, aes(x = ModuleName, y = Value)) +
+  geom_boxplot(aes(fill = Category)) + coord_cartesian(ylim=c(0, 450)) +
+  scale_fill_manual(values = palette_cat) +
+  facet_grid(Metric ~ Category, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=12,color="black",angle=60, hjust = 1),
+        axis.text.y=element_text(size=18,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=24)) + theme(axis.text.x = element_blank()) +
+  theme(legend.text = element_text(size = 20)) +
+  ylab("Richness\n")
+  
+figure_2c <- ggplot(betadisper_table_melt, aes(x = ModuleName, y = Value)) +
+  geom_boxplot(aes(fill = Category)) +
+#  scale_fill_manual(values = palette_cat) +
+  facet_grid(Metric ~ Category, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=16,color="black",angle=45, hjust = 1),
+        axis.text.y=element_text(size=18,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=24)) +
+  ylab("Beta-Dispersion\n") +
+  scale_color_discrete(guide = guide_legend(override.aes = list(color = "white"))) +
+  theme(legend.text = element_text(color = "white"),legend.title = element_text(color = "white"), legend.key = element_rect(fill = "white", color = "white")) + 
+  scale_fill_manual(values = palette_cat, guide = guide_legend(override.aes = list(fill = "white", color = "white", alpha = 1))) 
+
+figure_2 <- plot_grid(figure_2a, figure_2b, figure_2c, ncol = 1, rel_heights = c(0.95, 0.85, 1.2), labels = c("a)", "b)", "c)"), label_size = 20)
+figure_2
+
+# save_plot("final_figures/Figure_2.pdf", plot = figure_2, ncol = 1, base_width = 20, base_height = 12, scale = 1.5)
+
+```
+
+
+# 2.10) Making supplemental figure used to represent the beta-dispersion values across the various categories of functional modules.
+
+This code block includes the code used to generate:
+- Supplemental Figure 2
+
+```{r 2.10-supplemental-figure-2-betadispersion-boxplot, eval = T, fig.height = 6, fig.width = 10, results = 'hide'}
+
+  ############################
+  ## Supplemental Figure 2. ##
+  ############################
+
+################################################################################
+### Making a beta-dispersion plot for the full dataset, faceted by category. ###
+################################################################################
+  
+supplemental_fig_1 <- ggplot(betadisper_table_melt, aes(x = Category, y = Value)) +
+  geom_boxplot(aes(fill = Category)) +
+  scale_fill_manual(values = palette_cat) +
+  # facet_grid( ~ Category, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=24,color="black",angle=45, hjust = 1),
+        axis.text.y=element_text(size=18,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=18), plot.title = element_blank(),
+        legend.text = element_text(size = 20), legend.title = element_text(size = 22)) +
+  ylab("Beta-Dispersion\n")
+
+supplemental_fig_1
+
+# save_plot("final_figures/SupplementalFigure_2.pdf", plot = supplemental_fig_1, base_height = 8, base_width = 13, scale = 1.25)
+
+```
+
+# 2.11) Making supplemental figure used to represent the alpha-diversity and beta-dispersion values specfically for stresses.
+
+This code block includes the code used to generate:
+- Supplemental Figure 1
+
+```{r 2.11-supplemental-figure-1-stress-diversities, eval = T, fig.height = 8, fig.width = 8}
+
+###################################################################
+### Alpha-diversity and beta-dispersion plot for stress subset. ###
+###################################################################
+
+# Initialize the dataframe for making the stress boxplots.
+alpha_table_stress <- subset(alpha_table, Category %in% c("Soil", "Stresses")  &
+                               !Substrate %in% c("glucose", "2,4-D") & Stress != "pH6" | ModuleName %in% c("soil_control", "n-acetylglucosamine", "xylose", "xylan"))
+
+alpha_table_stress$Stress <- as.character(alpha_table_stress$Stress)
+alpha_table_stress$Stress[is.na(alpha_table_stress$Stress)] <- "soil"
+alpha_table_stress$Stress <- factor(alpha_table_stress$Stress, levels = c("soil", levels(sample_data(rar.16s)$Stress)))
+
+alpha_table_stress_melt <- melt(alpha_table_stress, variable.name = "Metric", value.name = "Value")
+alpha_table_stress_melt$Metric <- gsub("Observed", "Richness", alpha_table_stress_melt$Metric) %>%
+  factor(., levels = c("Shannon", "Richness", "BetaDisper"))
+
+# Make subset dataframes for each diversity metric.
+shannon_table_stress_melt <- subset(alpha_table_stress_melt, Metric == "Shannon")
+richness_table_stress_melt <- subset(alpha_table_stress_melt, Metric == "Richness")
+betadisper_table_stress_melt <- subset(alpha_table_stress_melt, Metric == "BetaDisper")
+
+
+  ############################
+  ## Supplemental Figure 1. ##
+  ############################
+
+stress_palette2 <- c("gray34", "gray75", viridis(4)[2:4], rev(magma(5)))
+
+supplementalfigure_1a <- ggplot(shannon_table_stress_melt, aes(x = Stress, y = Value)) +
+  geom_boxplot(aes(fill = Stress)) + coord_cartesian(ylim=c(0, 4)) + # <- This is code to change the y-axis w/o removing effect of outliers on the boxplot.
+  # scale_fill_manual(values = palette_cat) + # Not necessary, we specify it at the end.
+  # facet_grid(Metric ~ Stress, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=12,color="black",angle=60, hjust = 1),
+        axis.text.y=element_text(size=24,color="black"),
+        axis.title.y=element_text(size=28,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=24)) + theme(axis.text.x = element_blank()) +
+  ylab("Shannon\n\n") +
+  theme(plot.title = element_blank()) +
+  theme(legend.text = element_text(color = "white", size = 29),
+        legend.title = element_text(color = "white"), legend.key = element_rect(fill = "white", color = "white")) + 
+  scale_fill_manual(values = stress_palette2, guide = guide_legend(override.aes = list(fill = "white", color = "white", alpha = 1))) 
+# The last two lines of code to make the legend invisible. Doesn't change the figure dimensions!
+
+supplementalfigure_1b <- ggplot(richness_table_stress_melt, aes(x = Stress, y = Value)) +
+  geom_boxplot(aes(fill = Stress)) + coord_cartesian(ylim=c(0, 400)) +
+  scale_fill_manual(values = stress_palette2) +
+  # facet_grid(Metric ~ Stress, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size=12,color="black",angle=60, hjust = 1),
+        axis.text.y=element_text(size=24,color="black"),
+        axis.title.y=element_text(size=28,face="bold"),
+        axis.title.x = element_blank(), strip.text = element_blank(),
+        legend.text = element_text(size = 27), legend.title = element_text(size = 29),
+        text=element_text(size=24)) + theme(axis.text.x = element_blank()) +
+  ylab("Richness\n")
+  
+supplementalfigure_1c <- ggplot(betadisper_table_stress_melt, aes(x = Stress, y = Value)) +
+  geom_boxplot(aes(fill = Stress)) + coord_cartesian(ylim=c(0,0.75)) +
+#  scale_fill_manual(values = palette_cat) +
+  # facet_grid(Metric ~ Stress, scales = "free", space = "free_x") + 
+  theme(axis.text.x=element_text(size = 28, hjust = 1, angle = 45),
+        axis.text.y=element_text(size=24,color="black"),
+        axis.title.y=element_text(size=28,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=24)) +
+  ylab("Beta-Dispersion\n") +
+  scale_color_discrete(guide = guide_legend(override.aes = list(color = "white"))) +
+  theme(legend.text = element_text(color = "white", size = 29),
+        legend.title = element_text(color = "white"), legend.key = element_rect(fill = "white", color = "white")) + 
+  scale_fill_manual(values = stress_palette2, guide = guide_legend(override.aes = list(fill = "white", color = "white", alpha = 1))) 
+
+supplementalfigure_1 <- plot_grid(supplementalfigure_1a, supplementalfigure_1b, supplementalfigure_1c,
+                               ncol = 1, rel_heights = c(0.95, 0.95, 1.10), labels = c("a)", "b)", "c)"), label_size = 24, vjust = c(3.5, 1.5, 1.5))
+supplementalfigure_1
+
+# save_plot("final_figures/SupplementalFigure_1.pdf", plot = supplementalfigure_1, ncol = 1, base_width = 16, base_height = 12, scale = 1.5)
+
+
+```
+
+
+
+## 3) Investigating the third hypothesis through relative abundance trends.
+
+The third hypothesis is that the soil phylogenetic diversity will be substantially
+represented through functional module enrichments.
+
+
+# 3.1) Relative Abundance Trends across the entire dataset.
+
+This code block includes the code necessary to generate:
+- Figure 3 (both phylum- and class-level)
+
+```{r 3.1-relative-abundance-phylum-and-classlevel, fig.height = 8, fig.width = 14}
+
+##############################################################
+### Function for generating tables for count data by taxa. ###
+##############################################################
+
+# We can quickly customize our relative abundance graphs to any taxonomic level or number of top taxa
+# that we want using the below function, which generates a melt table with the top n classes' abundance
+# as columns and samples as rows. Also metadata is included, for simpler faceting in plots.
+
+# In these plots I'll be using the top 10 phyla (for phylum-level plot) and the top 15 classes (for class-level plot).
+
+relabundance_melttable <- function(phy, n = 10, rank = "Phylum"){
+  
+  # Assuming you haven't already done this, add in the rankings to the taxonomic table.
+  colnames(tax_table(phy)) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+  
+   # If the taxa is labeled with a prefix (e.g. p__Proteobacteria rather than Proteobacteria),
+  # we can get rid of that here.
+  tax_table(phy)[,rank] <- gsub("^.__", "", tax_table(phy)[,rank])
+  
+  # Determine what the top n phyla are. Doing 'n+1' in order to capture the unknown ('?') phylum.
+  top_taxa <- as.list(sort(tapply(taxa_sums(phy), tax_table(phy)[,rank], sum), TRUE)[1:(n+1)]) %>% names()
+ 
+  # If one of the top_taxa is unknown, we want to remove it from this list.
+  top_taxa <- top_taxa[top_taxa != "?"]
+  
+  # If not, we want to remove the extra element so we only have n elements in this list.
+  if(length(top_taxa) > n){
+    top_taxa <- top_taxa[1:(length(top_taxa) - 1)]
+  }
+  print(top_taxa)
+  
+  # Rename the taxa that aren't in the top n to just be "Other".
+  tax_table(phy)[!tax_table(phy)[,rank] %in% top_taxa,rank] <- "Other"
+
+  tax_table(phy)[,rank] <- factor(tax_table(phy)[,rank], levels = c(top_taxa, "Other")) %>% as.character()
+
+  # In order for us to glom successfully, we need to remove the columns prior to the taxrank we're using. E.g. if using 'Class',
+  # we need to remove 'Domain' and 'Phylum'.
+  tax_table(phy) <- tax_table(phy)[,which(colnames(tax_table(phy)) == rank):length(colnames(tax_table(phy)))]
+
+  phy.glom <- tax_glom(phy, taxrank = rank)
+  taxa_names(phy.glom) <- tax_table(phy.glom)[,rank]
+  
+  if(taxa_are_rows(phy.glom) == TRUE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), data.frame(t(otu_table(phy.glom))))
+  }
+  
+  if(taxa_are_rows(phy.glom) == FALSE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), data.frame(otu_table(phy.glom)))
+  }
+  
+  if("Replicate" %in% colnames(glom.table)){
+    glom.table$Replicate <- as.character(glom.table$Replicate)
+  }
+  
+  glom.melt <- melt(data = glom.table, value.name = "Abundance", variable.name = rank)
+
+  # Remove any NAs.
+  glom.melt <- glom.melt[!is.na(glom.melt[,rank]),]
+  
+  # Having a minor issue with Actinobacteria as a class becoming an NA down the line.
+  glom.melt[,rank] <- gsub("\\.class\\.", "\\(class\\)", glom.melt[,rank])
+
+  # Relevel the taxrank so 'Other' is last.
+  glom.melt[,rank] <- factor(glom.melt[,rank], levels = c(sort(top_taxa), "Other"))
+  
+  return(glom.melt)
+}
+
+
+################################################################################################
+### Use the above function to generate melt tables for the top 10 phylum and top 15 classes. ###
+################################################################################################
+
+phylum.melt <- relabundance_melttable(rar.16s, n = 10, rank = "Phylum")
+class.melt <- relabundance_melttable(rar.16s, n = 15, rank = "Class")
+
+# Relevel phylum.
+phylum.melt$Phylum <- factor(phylum.melt$Phylum, levels = c("Gemmatimonadetes", "Bacteroidetes", "Actinobacteria", "Thaumarchaeota",
+                                                            "Firmicutes", "Planctomycetes", "Acidobacteria",
+                                                            "Chloroflexi", "Proteobacteria", "Verrucomicrobia", "Other"))
+
+
+# Make palettes for these two graphs. Should include 'n' colors + grey for 'Other'.
+phylum.palette <- c(brewer.pal(10, "Spectral"), "gray34")
+class.palette <- c(viridis(7), rev(magma(8)), "gray34")
+
+  ###############
+  ## Figure 3. ##
+  ###############
+
+figure_3a <- ggplot(data=phylum.melt,aes(x=ModuleName,y=Abundance,fill=Phylum)) +
+  geom_bar(stat="identity", position = "fill") +
+  facet_grid( ~ Category, scales = "free_x", space = "free_x", labeller = labeller(groupwrap = label_wrap_gen(10))) +
+  scale_fill_manual(values = phylum.palette, drop = FALSE) +
+  theme(axis.text.x=element_text(size = 16, color = "black", angle = 45, hjust = 1),
+        axis.text.y=element_text(size=16,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=24)) +
+  xlab("Module") + ylab("Phylum-Level Relative Abundance\n") + theme(panel.spacing = unit(1, "lines")) +
+  theme(legend.text = element_text(size = 24), plot.title = element_blank()) +
+  ggtitle("Relative Abundance across all Functional Module Enrichments\n")
+
+figure_3b <- ggplot(data=class.melt,aes(x=ModuleName,y=Abundance,fill=Class)) +
+  geom_bar(stat="identity", position = "fill") +
+  facet_grid( ~ Category, scales = "free_x", space = "free_x", labeller = labeller(groupwrap = label_wrap_gen(10))) +
+  scale_fill_manual(values = class.palette, drop = FALSE) +
+  theme(axis.text.x=element_text(size = 16, color = "black", angle = 45, hjust = 1),
+        axis.text.y=element_text(size=16,color="black"),
+        axis.title.y=element_text(size=24,face="bold"),
+        axis.title.x = element_blank(),
+        text=element_text(size=24)) +
+  xlab("Module") + ylab("Class-Level Relative Abundance\n") + theme(panel.spacing = unit(1, "lines")) +
+  theme(legend.text = element_text(size = 24), plot.title = element_blank())
+
+figure_3 <- plot_grid(figure_3a, figure_3b,
+                               ncol = 1, rel_heights = c(1, 1), labels = c("a)", "b)"), label_size = 24)
+figure_3
+
+# save_plot("final_figures/Figure_3.pdf", plot = figure_3, ncol = 1, base_width = 20, base_height = 12, scale = 1.5)
+
+```
+
+
+# 3.2) Investigatory analysis to look at which are the major phyla and classes.
+
+```{r 3.2-rel-abundance-investigatory-analysis, results = 'hide'}
+
+#########################################################################################
+### Investigating the breakdown of overall percentages of major phyla in our dataset. ###
+#########################################################################################
+
+# Make a data object that has all the taxa grouped by overlying phylum.
+rar.16s.ph <- tax_glom(rar.16s, taxrank = "Phylum")
+tax_table(rar.16s.ph)[,1:2] <- gsub("^.__", "", tax_table(rar.16s.ph)[,1:2])
+
+# Note: this step below is necessary for differentiating between the '?' phyla.
+taxa_names(rar.16s.ph) <- paste(tax_table(rar.16s.ph)[,"Domain"], tax_table(rar.16s.ph)[,"Phylum"], sep = ".")
+
+# Now that we've relabeled the phylum, let's take a look at soils specifically.
+rar.soil <- subset_samples(rar.16s.ph, Substrate == "soilextract")
+rar.nosoil <- subset_samples(rar.16s.ph, Substrate != "soilextract")
+
+# Get the counts for the phyla in a table.
+soil_counts <- t(data.frame(otu_table(rar.soil)))
+full_counts <- t(data.frame(otu_table(rar.nosoil)))
+
+# colnames(soil_counts) <- tax_table(rar.soil)[,"Phylum"]
+# colnames(full_counts) <- tax_table(rar.nosoil)[,"Phylum"]
+
+soil_counts <- soil_counts / rardepth # Gets the percentages with respect to its prevalence in rarefaction depth.
+full_counts <- full_counts / rardepth
+# View(soil_counts)
+
+sort(colMeans(soil_counts) * 100) # <- Gets the percentages (not in decimal format), averaged across the replicates.
+
+  ## CONCLUSION => Across the 5 soil replicates, Proteobacteria averages 46.3% of readcounts, followed by Bacteroidetes at 44.3%,
+  ## Verrucomicrobia at 4.4%, and Actinobacteria at 1.21%.
+
+options(scipen = 0) # <- Turns off scientific notation.
+sort(colMeans(full_counts) * 100) %>% format(., scientific = F)
+
+  ## CONCLUSION => Across all the non-soil replicates, Protoebacteria is about 69.4% of readcounts, followed by Firmicutes at 23.2%,
+  ## Actinobacteria at 4.2%, and Bacteroidetes at 2.8%. Everything else is less than 0.14%.
+
+
+###############################################################################################
+### Testing to see what the levels of various phyla are within the simple substrate subset. ###
+###############################################################################################
+
+rar.simple <- subset_samples(rar.16s.ph, Category == "Simple Substrates")
+
+# Create a dataframe to counts how many times each substrate occurs.
+simple_reps <- table(sample_data(rar.simple)$Substrate) %>% data.frame()
+simple_reps2 <- setNames(data.frame(t(simple_reps[,2])), simple_reps$Var1)
+df.simple_reps <- simple_reps2[rep(1:nrow(simple_reps2),each=46),]
+# ^ We will be dividing by this in a moment.
+
+# Now group the rar.simple by substrate.
+sample_data(rar.simple)$Substrate <- factor(sample_data(rar.simple)$Substrate, levels = sort(unique(sample_data(rar.simple)$Substrate)))
+rar.simple <- merge_samples(rar.simple, "Substrate")
+
+# Make a dataframe with just the OTU counts.
+simple_counts <- t(data.frame(otu_table(rar.simple)))
+simple_counts <- (simple_counts / rardepth) * 100 # * 100 to get percentages
+simple_counts2 <- simple_counts / df.simple_reps # Divide the % by the number of replicates for each module to get the average % for each module.
+rownames(simple_counts2) <- rownames(simple_counts) # Make sure you keep the rownames consistent.
+rowMeans(simple_counts2)["Bacteria.Actinobacteria"] # <- average relative abundance of Actino for all simple substrates is 1.73%.
+# simple_counts2["Bacteria.Actinobacteria",]
+# simple_counts2["Bacteria.Firmicutes",]
+
+simple_counts3 <- simple_counts2[,!colnames(simple_counts2) %in% c("xylose", "n-acetylglucosamine")]
+rowMeans(simple_counts3)["Bacteria.Actinobacteria"] # <- average relative abundance of Actino without xylose or NAG is 0.78%.
+
+##########################################################################################
+### Repeating to the breakdown of overall percentages of major classes in our dataset. ###
+##########################################################################################
+
+rar.16s.cl <- tax_glom(rar.16s, taxrank = "Class")
+
+# Now that we've relabeled the phylum, let's take a look at soils specifically.
+rar.soil <- subset_samples(rar.16s.cl, Substrate == "soilextract")
+rar.nosoil <- subset_samples(rar.16s.cl, Substrate != "soilextract")
+
+# Get the counts for the phyla in a table.
+soil_counts <- t(data.frame(otu_table(rar.soil)))
+full_counts <- t(data.frame(otu_table(rar.nosoil)))
+colnames(soil_counts) <- tax_table(rar.soil)[,"Class"]
+colnames(full_counts) <- tax_table(rar.nosoil)[,"Class"]
+soil_counts <- soil_counts / rardepth # Gets the percentages with respect to its prevalence in rarefaction depth.
+full_counts <- full_counts / rardepth
+# View(soil_counts)
+
+sort(colMeans(soil_counts) * 100) %>% format(., scientific = F)
+
+  ## CONCLUSION => Across the 5 soil replicates, the top classes are Chitinophagia (18.7%), Alphaproteobacteria (18.0%),
+  ## Betaproteobacteria (16.6%), Gammaproteobacteria (11.65%), Cytophagia (10.8%), etc.
+
+sort(colMeans(full_counts) * 100) %>% format(., scientific = F)
+
+  ## CONCLUSION => Across all the non-soil replicates, Gammaproteobacteria is much higher at 62.3%, followed by Bacilli (18.2%),
+  ## Clostridia (4.90%), Actinobacteria_class (4.1%), Alphaproteobacteria (4.0%), Betaproteobacteria (3.05%), etc.
+
+```
+
+# 3.3) Investigating the major genera in each of our categories.
+
+```{r 3.3-rel-abundance-investigatory-analysis-genus, results = 'hide'}
+
+# Making a phyloseq object glommed by genus.
+rar.16s.genus <- tax_glom(rar.16s, taxrank = "Genus")
+tax_table(rar.16s.genus)[,"Genus"] <- gsub("g__", "", tax_table(rar.16s.genus)[,"Genus"])
+
+# Now that we've relabeled the Genus, let's take a look at soils specifically.
+rar.soil <- subset_samples(rar.16s.genus, Substrate == "soilextract")
+rar.nosoil <- subset_samples(rar.16s.genus, Substrate != "soilextract")
+rar.simple <- subset_samples(rar.16s.genus, Category == "Simple Substrates")
+rar.poly <- subset_samples(rar.16s.genus, Category == "Polysaccharides")
+rar.anaerobic <- subset_samples(rar.16s.genus, Category == "Anaerobic")
+
+# Get the counts for the Genus in a table.
+soil_counts <- t(data.frame(otu_table(rar.soil)))
+full_counts <- t(data.frame(otu_table(rar.nosoil)))
+simple_counts <- t(data.frame(otu_table(rar.simple)))
+poly_counts <- t(data.frame(otu_table(rar.poly)))
+anaerobic_counts <- t(data.frame(otu_table(rar.anaerobic)))
+
+colnames(soil_counts) <- tax_table(rar.soil)[,"Genus"]
+colnames(full_counts) <- tax_table(rar.nosoil)[,"Genus"]
+colnames(simple_counts) <- tax_table(rar.simple)[,"Genus"]
+colnames(poly_counts) <- tax_table(rar.poly)[,"Genus"]
+colnames(anaerobic_counts) <- tax_table(rar.anaerobic)[,"Genus"]
+
+
+soil_counts <- soil_counts / rardepth # Gets the percentages.
+full_counts <- full_counts / rardepth
+simple_counts <- simple_counts/rardepth
+poly_counts <- poly_counts/rardepth
+anaerobic_counts <- anaerobic_counts/rardepth
+# View(soil_counts)
+
+options(scipen = 0)
+sort(colMeans(soil_counts) * 100) # <- Gets the percentages (not in decimal format), averaged across the 8 replicates.
+# Pseudomonas is only about 11% of relative abundance in the soils (Polaromonas is higher at 12.8%.)
+sort(colMeans(full_counts) * 100) # <- Across the full dataset, Pseudomonas is about 61.4% of relative abundance.
+sort(colMeans(simple_counts) * 100) # <- For the simple substrates dataset, Pseudomonas is on average 91% of relative abundance.
+sort(colMeans(poly_counts) * 100) # For polysaccharide modules, Pseudomonas is on average 50.3% relative abundance.
+sort(colMeans(anaerobic_counts) * 100) # Pseudomonas is down to 22.7% here, and both Paenibacillus and Clostridium_sensu_stricto_1 are higher.
+
+  ##########################################################################################
+  ### What is the range of Pseudomonas relative abundance across modules for a category? ###
+  ##########################################################################################
+
+# Going to try to get the range of Pseudomonas relative abundances for each module in the Simple Substrates category.
+simple_counts.meta <- cbind(data.frame(sample_data(rar.simple)), simple_counts)
+sort(tapply(simple_counts.meta$Pseudomonas, simple_counts.meta$ModuleName, mean) * 100)
+# Xylose has 33.9%, NAG 75.9%, glucosamine 79.5%, arabinose 84.4%, D-gluc 88.6%. Everything else (13 modules) is above 90%,
+# with 10 of those being above 99%.
+
+poly_counts.meta <- cbind(data.frame(sample_data(rar.poly)), poly_counts)
+sort(tapply(poly_counts.meta$Pseudomonas, poly_counts.meta$ModuleName, mean) * 100)
+
+  ## CONCLUSION => Pseudomonas is greatly increased from soil (16%) to functional modules (62%), especially simple substrates (91%).
+
+
+```
+
+
+
+## 4) Investigating the third hypothesis through core microbiome analysis.
+
+To see just how much of the soil microbiome was recaptured through our enrichment approach,
+we can calculate cores for all of our enrichments and for soil, then see how many soil core taxa
+were also captured in at least one enrichment core.
+
+# 4.1) Functions for generating the core microbiome.
+
+```{r indicator-functions, eval = T, include = F}
+
+###################################################################################################
+### Function that takes a phyloseq object, subsets it down to a module, then calculates a core. ###
+###################################################################################################
+
+# The criteria we are using for our core that a taxa is present in at least 40% of replicates (at least 2 reps),
+# and has > 0.01% of cumulative readcounts for that core.
+
+get_core_otus.table <- function(physeq, modulename, pct = 0.4){
+  
+  # 1. Get your subset.
+  modulename <- as.character(modulename)
+  subset.16s <- prune_samples(sample_data(physeq)$ModuleName == modulename, physeq)
+
+  
+  # 2. Make your OTU dataframe.
+  subset.otus <- data.frame(otu_table(subset.16s))
+  sample_data(subset.16s)$ModuleRep <- with(sample_data(subset.16s), interaction(ModuleName, Replicate))
+  colnames(subset.otus) <- sample_data(subset.16s)$ModuleRep
+  subset.otus <- subset.otus[rowSums(subset.otus)>0,]
+  
+  # 3. Get the full value for full readcount abundance for all OTUs in the subset.otus dataframe.
+  cumulative <- sum(colSums(subset.otus))
+  
+  # 4. Subset the dataframe to just those present in at least [amount you specify as pct] % of samples.
+  cutoff <- ncol(subset.otus) * pct
+  
+  notzero <- data.frame(apply(subset.otus, 1, function(c)sum(c!=0)))
+  greaterthanpct <- data.frame(apply(notzero, 1, function(c)(c>=cutoff))) 
+  
+  colnames(greaterthanpct) <- "Persistence"
+  greaterthanpct$Rownames <- rownames(greaterthanpct)
+  greaterthanpct <- greaterthanpct[(greaterthanpct$Persistence == TRUE),]
+  subset.otus <- subset(subset.otus, rownames(subset.otus) %in% rownames(greaterthanpct))
+  
+  # 5. Subset the dataframe to those greater than 0.01% of the cumulative abundance.
+  core <- subset.otus[rowSums(subset.otus) > (cumulative * 0.0001),]
+  core$sums <- rowSums(core)
+  
+  # 6. Get the taxonomic information, including Phylum, Class, Genus, and OTU.
+  core$Phylum <- tax_table(subset.16s)[rownames(tax_table(subset.16s)) %in% rownames(core),
+                                       colnames(tax_table(subset.16s)) == "Phylum"] %>% gsub("p__", "", .)
+  
+  core$Class <- tax_table(subset.16s)[rownames(tax_table(subset.16s)) %in% rownames(core),
+                                       colnames(tax_table(subset.16s)) == "Class"] %>% gsub("c__", "", .)
+  
+  core$Genus <- tax_table(subset.16s)[rownames(tax_table(subset.16s)) %in% rownames(core),
+                                       colnames(tax_table(subset.16s)) == "Genus"] %>% gsub("g__", "", .)
+  core$OTU <- rownames(core)
+  
+  # Create one column that has all of the taxonomic information combined.
+  core$Taxa <- with(core, interaction(OTU, Phylum, Class, Genus, sep = "."))
+  
+  return(core)
+}
+
+########################################################################################################
+### Function that takes a core table and reduces it down to unique taxa, each having a count of '1'. ###
+########################################################################################################
+
+# We will need this for consolidating all of the cores together.
+
+get_core_counts.table <- function(table, name){
+  x <- table %>% group_by(Taxa) %>% summarize(count = n()) %>% arrange(-count) %>% data.frame()
+  x$Taxa <- as.character(x$Taxa)
+  x$ModuleName <- name
+  
+  return(x)
+}
+
+```
+
+
+# 4.2) Generating a cumulative data object with all the cores for all modules.
+
+This code block contains the code necessary to generate:
+- Figure 5B
+- Figure 5C
+- Figure 5D
+
+```{r 4.2-stepwise-core, fig.height = 8, fig.width = 6}
+
+# Create a list of all the modules included in this analysis.
+module_list <- unique(sample_data(rar.16s)$ModuleName)
+full_metadata <- data.frame(sample_data(rar.16s))
+
+# Initialize a dataframe to which we will add the core information.
+stepwise.core <- as.data.frame(matrix(nrow = 0, ncol = 6))
+colnames(stepwise.core) <- c("Taxa", "OTU", "Phylum", "Genus", "count", "ModuleName")
+
+#######################################################
+### Generate a table encompassing all of the cores. ###
+#######################################################
+
+# Note: this takes a couple minutes to run, longer depending on how complex the dataset is.
+
+for(module_name in module_list){
+  print(module_name) # Tracking how far we've gone.
+  module_core <- get_core_otus.table(physeq = rar.16s, modulename = module_name, pct = 0.4)
+  module_table <- get_core_counts.table(table = module_core, name = module_name)
+
+  stepwise.core <- rbind(stepwise.core, module_table)
+}
+
+stepwise.core.duplicate <- stepwise.core
+
+##########################################################
+### Add in the appropriate metadata to the core table. ###
+##########################################################
+
+full.cat.mod <- dplyr::select(full_metadata, ModuleName, Category) # Making this dataframe as an easy way to reassign 'Category' in our core table.
+full.cat.mod <- full.cat.mod[!duplicated(full.cat.mod),]
+full.cat.mod$Category <- as.character(full.cat.mod$Category)
+
+for(i in 1:nrow(stepwise.core)){
+  cat <- as.character(full.cat.mod[full.cat.mod$ModuleName == stepwise.core$ModuleName[i], colnames(full.cat.mod) == "Category"])
+  stepwise.core$Category[i] <- cat
+}
+
+
+##########################################################################################################################
+### Make separate dataframes for each of the main categories we want to consider, removing duplicate entries for OTUs. ###
+##########################################################################################################################
+
+soil_stepwise_otus <- stepwise.core[stepwise.core$Category == "Soil",]
+
+simple_stepwise_otus <- stepwise.core[stepwise.core$Category == "Simple Substrates",]
+simple_stepwise_otus <- simple_stepwise_otus[!duplicated(simple_stepwise_otus$Taxa),]
+
+antibiotic_stepwise_otus <- stepwise.core[stepwise.core$Category == "Antibiotics",]
+antibiotic_stepwise_otus <- antibiotic_stepwise_otus[!duplicated(antibiotic_stepwise_otus$Taxa),]
+
+anaerobic_stepwise_otus <- stepwise.core[stepwise.core$Category == "Anaerobic",]
+anaerobic_stepwise_otus <- anaerobic_stepwise_otus[!duplicated(anaerobic_stepwise_otus$Taxa),]
+
+complex_stepwise_otus <- stepwise.core[stepwise.core$Category == "Polysaccharides",]
+complex_stepwise_otus <- complex_stepwise_otus[!duplicated(complex_stepwise_otus$Taxa),]
+
+stresses_stepwise_otus <- stepwise.core[stepwise.core$Category == "Stresses",]
+stresses_stepwise_otus <- stresses_stepwise_otus[!duplicated(stresses_stepwise_otus$Taxa),]
+
+
+##############################################################
+### Setting up the dataframe for the 'stepwise' core plot. ###
+##############################################################
+
+# This graph looks at how many soil core OTUs have been captured CONSECUTIVELY in the
+# categories - e.g. how many in Simple Substrates, how many in Simple Substrates and Antibiotics,
+# etc. The below codes makes a dataframe that encompasses all those combinations.
+
+simple.antibiotic <- rbind(simple_stepwise_otus, antibiotic_stepwise_otus[!antibiotic_stepwise_otus$Taxa %in% simple_stepwise_otus$Taxa,])
+simple_stepwise_otus$Category2 <- "SimpleSubstrates"
+
+simple.antibiotic.complex <- rbind(simple.antibiotic, complex_stepwise_otus[!complex_stepwise_otus$Taxa %in% simple.antibiotic$Taxa,])
+simple.antibiotic$Category2 <- "+Antibiotics"
+
+simple.antibiotic.complex.anaerobic <- rbind(simple.antibiotic.complex, anaerobic_stepwise_otus[!anaerobic_stepwise_otus$Taxa %in% simple.antibiotic.complex$Taxa,])
+simple.antibiotic.complex$Category2 <- "+Polysaccharides"
+
+simple.antibiotic.complex.anaerobic.stress <- rbind(simple.antibiotic.complex.anaerobic,
+                                                    stresses_stepwise_otus[!stresses_stepwise_otus$Taxa %in% simple.antibiotic.complex.anaerobic$Taxa,])
+simple.antibiotic.complex.anaerobic$Category2 <- "+Anaerobic"
+
+simple.antibiotic.complex.anaerobic.stress$Category2 <- "+Stresses"
+
+# Join all of these together.
+conjoined <- rbind(simple_stepwise_otus, simple.antibiotic, simple.antibiotic.complex, simple.antibiotic.complex.anaerobic, simple.antibiotic.complex.anaerobic.stress)
+
+
+######################################################################################################
+### Differentiating between enrichment core OTUs that are present or not present in the soil core. ###
+######################################################################################################
+
+# If any of the core OTUs in the conjoined object are NOT in the list of soil OTUs (i.e. they are unique to our enrichments), their count becomes -1.
+
+soil_list <- unique(soil_stepwise_otus$Taxa)
+for(i in 1:nrow(conjoined)){
+  taxon <- conjoined$Taxa[i]
+  if(!taxon %in% soil_list){
+    conjoined$count[i] <- -1
+    conjoined$AboveBelow[i] <- "unique"
+  }
+  if(taxon %in% soil_list){
+     conjoined$AboveBelow[i] <- "in_soil"
+  }
+}
+
+# Now edit the soil control so it can be joined with the above.
+soil_stepwise_otus$AboveBelow <- "in_soil"
+soil_stepwise_otus$Category2 <- "Soil_Control"
+
+# Now join soil control with the conjoined object.
+conjoined.soil <- rbind(soil_stepwise_otus, conjoined)
+
+# Separate 'taxa' into four columns, so we can use the 'phylum' or 'class' information.
+conjoined.soil <- separate(conjoined.soil, col = "Taxa", into = c("OTU_0", "Phylum_0", "Class_0", "Genus_0"), sep = "\\.")
+conjoined.soil$Phylum_0 <- gsub("Ca", "Ca_Hydrogenedentes", conjoined.soil$Phylum_0)
+
+# Delineating which are our top 10 phyla.
+top_ph <- c("p__Gemmatimonadetes", "p__Bacteroidetes", "p__Actinobacteria", "p__Armatimonadetes", "p__Firmicutes", "p__Planctomycetes",
+           "p__Acidobacteria", "p__Chloroflexi", "p__Proteobacteria", "p__Verrucomicrobia")
+top_ph_edit <- gsub("p__", "", top_ph)
+
+# If taxa don't fit within our top 10 phyla as defined below, we're going to classify them as 'Other'.
+for(i in 1:nrow(conjoined.soil)){
+  if(!conjoined.soil$Phylum_0[i] %in% top_ph_edit){
+    conjoined.soil$Phylum_0[i] <- "Other"
+  }
+}
+
+conjoined.soil$Phylum <- paste(conjoined.soil$Phylum_0, conjoined.soil$AboveBelow, sep = "_")
+
+# Releveling our phylum. We have separate levels for what phylum taxa are in soil and which are unique to enrichments.
+conjoined.soil$Phylum <- factor(conjoined.soil$Phylum, levels = c("Gemmatimonadetes_in_soil", "Bacteroidetes_in_soil", "Actinobacteria_in_soil",
+                                                                  "Armatimonadetes_in_soil",  "Firmicutes_in_soil",  "Planctomycetes_in_soil",
+                                                                  "Acidobacteria_in_soil",  "Chloroflexi_in_soil", "Proteobacteria_in_soil",
+                                                                  "Verrucomicrobia_in_soil", "Other_in_soil",
+                                                                  "Gemmatimonadetes_unique", "Bacteroidetes_unique", "Actinobacteria_unique",
+                                                                  "Armatimonadetes_unique",  "Firmicutes_unique",  "Planctomycetes_unique",
+                                                                  "Acidobacteria_unique",  "Chloroflexi_unique", "Proteobacteria_unique",
+                                                                  "Verrucomicrobia_unique", "Other_unique"))
+
+# Releving the Category
+conjoined.soil$Category2 <- factor(conjoined.soil$Category2, levels = c("Soil_Control",  "SimpleSubstrates", "+Antibiotics",
+                                                                         "+Polysaccharides", "+Anaerobic","+Stresses"))
+
+# Making a palette. We use darker or lighter versions of the same colors to symbolize
+# if it's in soil or unique to enrichments.
+palette1to11 <- c(brewer.pal(10, "Spectral"), "black")
+palette12to22 <- lighten(palette1to11, amount = 0.25, method = "relative")
+palette22 <- c(palette1to11, palette12to22)
+
+  ################
+  ## Figure 5B. ##
+  ################
+
+full.stepwise.plot <- ggplot(data = conjoined.soil, aes(x = Category2, y = count, fill = Phylum)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = palette22, drop = FALSE) + xlab("Module Category") + ylab("Number of Core OTUs") +
+  theme(axis.text.x=element_text(size=24,color="black", angle = 60, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title.y=element_text(size=24,face="bold"), text=element_text(size=14), axis.title.x = element_blank()) +
+  theme(plot.title = element_text(size = 30, face = "bold")) + 
+  guides(fill = guide_legend(ncol = 1)) + 
+  # theme(legend.position = "none") +
+  ggtitle("Unique vs. Shared\nCore OTUs")
+
+# full.stepwise.plot
+
+# ggsave("fulldataset_analysis/cores/stepwiseplot.jpg", plot = stepwise.plot, width = 10, height = 20)
+
+
+###############################################################################################
+### Making a condensed version of Figure 5B to compare relative abundances of core OTUs     ###
+### in soils, soil cores in functional modules, and core OTUs unique to functional modules. ###
+###############################################################################################
+
+conjoined.soil2 <- conjoined.soil
+
+# Modifying the dataframe to be useful for this specific comparison.
+core.comparisons <- subset(conjoined.soil2, Category2 %in% c("Soil_Control", "+Stresses"))
+core.comparisons$Category2 <- as.character(core.comparisons$Category2)
+
+core.comparisons[core.comparisons$Category2 == "Soil_Control", colnames(core.comparisons) == "Category2"] <- "Soil Core OTUs"
+
+core.comparisons[core.comparisons$Category2 == "+Stresses" & core.comparisons$AboveBelow == "in_soil",
+                 colnames(core.comparisons) == "Category2"] <- "Soil Core OTUs\nIn Functional Modules"
+core.comparisons[core.comparisons$Category2 == "+Stresses" & core.comparisons$AboveBelow == "unique",
+                 colnames(core.comparisons) == "Category2"] <- "Core OTUs Unique\nto Functional Modules"
+core.comparisons$Phylum <- gsub("_.*$", "", core.comparisons$Phylum)
+core.comparisons$count <- 1
+
+# Relevel Category2 and Phylum.
+core.comparisons$Category2 <- factor(core.comparisons$Category2, levels = c("Soil Core OTUs",
+                                                                            "Soil Core OTUs\nIn Functional Modules",
+                                                                            "Core OTUs Unique\nto Functional Modules"))
+core.comparisons$Phylum <- factor(core.comparisons$Phylum, levels = c("Gemmatimonadetes", "Bacteroidetes",
+                                                                      "Actinobacteria", "Armatimonadetes",
+                                                                      "Firmicutes", "Planctomycetes",
+                                                                      "Acidobacteria", "Chloroflexi",
+                                                                      "Proteobacteria", "Verrucomicrobia",
+                                                                      "Other"))
+
+  ################
+  ## Figure 5C. ##
+  ################
+
+core.comparisons.plot <- ggplot(data = core.comparisons, aes(x = Category2, y = count, fill = Phylum)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = c(brewer.pal(10, "Spectral"), "gray34"), drop = FALSE) + xlab("Module Category") + ylab("Relative Abundance of Core OTUs") +
+  theme(axis.text.x=element_text(size=24,color="black", angle = 60, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title.y=element_text(size=24,face="bold"), text=element_text(size=14), axis.title.x = element_blank()) +
+  theme(plot.title = element_text(size = 30, face = "bold")) + 
+  guides(fill = guide_legend(ncol = 1)) + 
+  # theme(legend.position = "none") +
+  ggtitle("Core OTU Profiles")
+
+core.comparisons.plot
+
+###############################################################################
+### Investigating just how many soil core OTUs are captured in enrichments. ###
+###############################################################################
+
+neg.conjoined.soil <- conjoined.soil[conjoined.soil$count == -1,]
+pos.conjoined.soil <- conjoined.soil[conjoined.soil$count == 1,]
+
+aggregate(pos.conjoined.soil$count, by = list(Category2 = pos.conjoined.soil$Category2), FUN = 'sum')
+
+# Soil Control Core OTUs =                                241
+# Simple Substrate Core OTUs in Soil =                    21
+#  (above) + Antibiotics Core OTUs in Soil =              30 (+ 9)
+#  (above) + Complex Polysaccharides Core OTUs in Soil =  50 (+ 20)
+#  (above) + Anaerobic Core OTUs in Soil =                50 (+ 0)
+#  (above) + Stresses Core OTUs in Soil =                 90 (+ 40)
+
+aggregate(neg.conjoined.soil$count, by = list(Category2 = neg.conjoined.soil$Category2), FUN = 'sum')
+
+# Simple Substrate Core OTUs NOT in Soil =                  111
+# (above) + Antibiotics Core OTUs NOT in Soil =             158 (+ 47)
+# (above) + Complex Polysaccharides Core OTUs NOT in Soil = 215 (+ 57)
+# (above) + Anaerobic Core OTUs NOT in Soil =               232 (+ 17)
+# (above) + Stresses Core OTUs NOT in Soil =                481 (+ 249)
+
+  ## CONCLUSION =>  We capture ~37.3% of soil core OTUs through enrichments (90 / 241) and also
+  ## obtain 481 core OTUs unique to enrichments.
+
+
+###############################################################################
+### Which individual module was most effective in capturing soil diversity? ###
+###############################################################################
+
+# Create a list of all the unique core taxa in the soil.
+modulewise_soilotus <- stepwise.core[stepwise.core$Category == "Soil",colnames(stepwise.core) == "Taxa"]
+
+# Subset the core object to just taxa that are present in soils.
+modulecores_insoil <- subset(stepwise.core, stepwise.core$Taxa %in% modulewise_soilotus)
+
+# Separate 'taxa' into three columns, so we can use the 'phylum' information.
+modulecores_insoil <- separate(modulecores_insoil, col = "Taxa", into = c("OTU", "Phylum", "Class", "Genus"), sep = "\\.")
+modulecores_insoil$Phylum <- gsub("Ca", "Ca_Hydrogenedentes", modulecores_insoil$Phylum)
+
+# If the phylum isn't in the top 10 phyla, we label it as 'Other'.
+for(i in 1:nrow(modulecores_insoil)){
+  if(!modulecores_insoil$Phylum[i] %in% top_ph_edit){
+    modulecores_insoil$Phylum[i] <- "Other"
+  }
+}
+
+# Releveling 'Category' and 'Phylum' appropriately.
+modulecores_insoil$Category <- factor(modulecores_insoil$Category, levels = levels(full_metadata$Category))
+
+modulecores_insoil$Phylum <- factor(modulecores_insoil$Phylum, levels = c("Gemmatimonadetes", "Bacteroidetes", "Actinobacteria", "Armatimonadetes",
+                                                                          "Firmicutes", "Planctomycetes", "Acidobacteria", "Chloroflexi", 
+                                                                          "Proteobacteria", "Verrucomicrobia", "Other"))
+  ################
+  ## Figure 5D. ##
+  ################
+
+modulewise.plot <- ggplot(data = modulecores_insoil[modulecores_insoil$Category != "Soil",], aes(x = ModuleName, y = count, fill = Phylum)) +
+  geom_bar(stat = "identity") +
+  facet_grid(~ Category, scales = "free_x", space = "free_x") +
+   scale_fill_manual(values = palette22, drop = FALSE) + xlab("Module Category") + ylab("Number of Core OTUs") +
+  theme(axis.text.x=element_text(size=10,color="black", angle = 45, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title.y=element_text(size=24,face="bold"), text=element_text(size=14), axis.title.x = element_blank()) +
+  theme(plot.title = element_text(size = 30, face = "bold", hjust = 0.5)) + 
+  guides(fill = guide_legend(ncol = 1)) + # theme(legend.position = "none") +
+  ggtitle("Soil Core OTUs in\nFunctional Module Enrichments")
+
+# modulewise.plot
+
+```
+
+# 4.3) Making an individual, non-cumulative, data object for cores by module category.
+
+We may also want to investigate the categories on an individual basis, to see which of them is
+the most effective for capturing the diversity present in the soil core microbiome.
+
+This code block includes the code necessary to generate:
+- Figure 5A
+
+```{r 4.3-stepwisecore-individual, eval = T}
+
+##############################################################################
+### Making a data frame including the module core OTUs also found in soil. ###
+##############################################################################
+
+# Merge the dataframes.
+unique_otus <- (rbind(dplyr::select(soil_stepwise_otus, Taxa, count, ModuleName, Category),
+             dplyr::select(simple_stepwise_otus[simple_stepwise_otus$Taxa %in% soil_stepwise_otus$Taxa,],
+                           Taxa, count, ModuleName, Category),
+             dplyr::select(antibiotic_stepwise_otus[antibiotic_stepwise_otus$Taxa %in% soil_stepwise_otus$Taxa,],
+                           Taxa, count, ModuleName, Category),
+             dplyr::select(complex_stepwise_otus[complex_stepwise_otus$Taxa %in% soil_stepwise_otus$Taxa,],
+                           Taxa, count, ModuleName, Category),
+             dplyr::select(anaerobic_stepwise_otus[anaerobic_stepwise_otus$Taxa %in% soil_stepwise_otus$Taxa,],
+                           Taxa, count, ModuleName, Category),
+             dplyr::select(stresses_stepwise_otus[stresses_stepwise_otus$Taxa %in% soil_stepwise_otus$Taxa,],
+                           Taxa, count, ModuleName, Category)))
+
+
+# Separate 'taxa' into three columns, so we can use the 'phylum' information.
+unique_otus <- separate(unique_otus, col = "Taxa", into = c("OTU", "Phylum", "Class", "Genus"), sep = "\\.")
+unique_otus$Phylum <- gsub("Ca", "Ca_Hydrogenedentes", unique_otus$Phylum)
+
+# If the phylum isn't in the top 10 phyla, we label it as 'Other'.
+for(i in 1:nrow(unique_otus)){
+  if(!unique_otus$Phylum[i] %in% top_ph_edit){
+    unique_otus$Phylum[i] <- "Other"
+  }
+}
+
+# Releveling 'Category' and 'Phylum' appropriately.
+unique_otus$Category <- factor(unique_otus$Category, levels = levels(full_metadata$Category))
+
+unique_otus$Phylum <- factor(unique_otus$Phylum, levels = c("Gemmatimonadetes", "Bacteroidetes", "Actinobacteria", "Armatimonadetes",
+                                                                          "Firmicutes", "Planctomycetes", "Acidobacteria", "Chloroflexi", 
+                                                                          "Proteobacteria", "Verrucomicrobia", "Other"))
+  ################
+  ## Figure 5A. ##
+  ################
+
+unique.stepwise.plot <- ggplot(data = unique_otus, aes(x = Category, y = count, fill = Phylum)) +
+  geom_bar(stat = "identity") +
+#  facet_grid(~ ModuleCategory, scales = "free_x", space = "free_x") +
+   scale_fill_manual(values = palette22, drop = FALSE) + xlab("Module Category") + ylab("Number of Core OTUs") +
+  theme(axis.text.x=element_text(size=24,color="black", angle = 60, hjust = 1), axis.text.y=element_text(size=16,color="black"),
+        axis.title.y=element_text(size=24,face="bold"), text=element_text(size=14), axis.title.x = element_blank()) +
+  theme(plot.title = element_text(size = 30, face = "bold")) + 
+  guides(fill = guide_legend(ncol = 1)) + theme(legend.position = "none") +
+  ggtitle("Soil Core OTUs in\nFunctional Module Enrichments")
+
+# stepwise.individual.plot
+
+
+aggregate(unique_otus$count, by = list(Category = unique_otus$Category), FUN = 'sum')
+
+  ## CONCLUSION => There are 241 core OTUs in soil. Of these, stresses have 80, antibiotics have 26,
+  ## polysaccharides have 45, simple substrates have 21, and anaerobic have 11.
+
+```
+
+# 4.4) Conjoining final_figures 5A and 5B together into one figure.
+
+```{r 4.4-conjoining-core-plots, fig.height = 12, fig.width = 16}
+
+  ###############
+  ## Figure 5. ##
+  ###############
+
+figure_5a <- ggplot(data = unique_otus, aes(x = Category, y = count, fill = Phylum)) +
+  geom_bar(stat = "identity") +
+#  facet_grid(~ ModuleCategory, scales = "free_x", space = "free_x") +
+   scale_fill_manual(values = palette22, drop = FALSE) + xlab("Module Category") + ylab("Number of Core OTUs (in Soil)\n") +
+  theme(axis.text.x=element_text(size=30,color="black", angle = 45, hjust = 1), axis.text.y=element_text(size=30,color="black"),
+        axis.title.y=element_text(size=30,face="bold"), text=element_text(size=14), axis.title.x = element_blank()) +
+  theme(plot.title = element_blank()) + 
+  guides(fill = guide_legend(ncol = 1)) + theme(legend.position = "none") +
+  ggtitle("Soil Core OTUs in Enrichments\nby Category")
+
+conjoined.soil$Category2 <- plyr::revalue(conjoined.soil$Category2, c("Soil_Control" = "Soil", "SimpleSubstrates" = "Simple Substrates",
+                                                                "+Stresses" = "+ Stresses", "+Anaerobic" = "+ Anaerobic",
+                                                                "+Polysaccharides" = "+ Polysaccharides", "+Antibiotics" = "+ Antibiotics"))
+
+figure_5b <- ggplot(data = conjoined.soil, aes(x = Category2, y = count, fill = Phylum)) +
+  geom_bar(stat = "identity") +
+#  facet_grid(~ ModuleCategory, scales = "free_x", space = "free_x") +
+   scale_fill_manual(values = palette22, drop = FALSE) + xlab("Module Category") + ylab("\nNumber of Core OTUs (in Soil or Unique to Modules)\n") +
+  theme(axis.text.x=element_text(size=30,color="black", angle = 45, hjust = 1), axis.text.y=element_text(size=30,color="black"),
+        axis.title.y=element_text(size = 30, color = "black", face = "bold"), text=element_text(size=14), axis.title.x = element_blank()) +
+  theme(plot.title = element_blank()) + theme(legend.title=element_text(size=32)) + theme(legend.text = element_text(size=18)) +
+  theme(legend.position = "none") +
+  ggtitle("Unique vs. Shared Core OTUs\n")
+
+
+figure_5c <- ggplot(data = core.comparisons, aes(x = Category2, y = count, fill = Phylum)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_fill_manual(values = c(brewer.pal(10, "Spectral"), "gray34"), drop = FALSE) + xlab("Module Category") + ylab("\nRelative Abundance of Core OTUs\n") +
+  theme(axis.text.x=element_text(size=27,color="black", angle = 45, hjust = 0.5, vjust = 0.5), axis.text.y=element_text(size=30,color="black"),
+        axis.title.y=element_text(size=30,face="bold"), text=element_text(size=14), axis.title.x = element_blank()) +
+  theme(plot.title = element_blank()) + theme(legend.title=element_text(size=32)) + theme(legend.text = element_text(size=27)) +
+  guides(fill = guide_legend(ncol = 1)) + 
+  # theme(legend.position = "none") +
+  ggtitle("Core OTU Profiles\n")
+
+
+figure_5d <- ggplot(data = modulecores_insoil[modulecores_insoil$Category != "Soil",], aes(x = ModuleName, y = count, fill = Phylum)) +
+  geom_bar(stat = "identity") +
+  facet_grid(~ Category, scales = "free_x", space = "free_x") +
+   scale_fill_manual(values = palette22, drop = FALSE) + xlab("Module Category") + ylab("Number of Core OTUs (in Soil)\n") +
+  theme(axis.text.x=element_text(size=20,color="black", angle = 45, hjust = 1), axis.text.y=element_text(size=30,color="black"),
+        axis.title.y=element_text(size=30,face="bold"), text=element_text(size=36), axis.title.x = element_blank()) +
+  theme(plot.title = element_text(size = 30, face = "bold", color = "white")) + 
+  guides(fill = guide_legend(ncol = 1)) + theme(legend.position = "none") +
+  ggtitle("\nSoil Core OTUs in Module Enrichments by Module\n")
+
+
+figure_5abc <- plot_grid(figure_5a, figure_5b, figure_5c, ncol = 3, labels = c("a)", "b)", "c)"),
+                         label_size = 30, rel_widths = c(0.9, 1, 1.1), hjust = c(-0.5, -1.5, -1.5))
+figure_5 <- plot_grid(figure_5abc, figure_5d, nrow = 2, labels = c("", "d)"), label_size = 30)
+figure_5
+# save_plot("final_figures/Figure_5.pdf", plot = figure_5, ncol = 1, base_width = 24, base_height = 21, scale = 1.5)
+
+```
+
+# 4.5) Making a Venn Diagram for polysaccharide module cores.
+
+```{r 4.5-polysaccharide-core-venndiagram, eval = T, fig.height = 4, fig.width = 4}
+
+##############################################################################
+### How do polysaccharide cores compare? What is the overlap by substrate? ###
+##############################################################################
+
+# Make a specific subset of the previously-generated core microbiome table,
+# for only the polysaccharide cores.
+polysaccharide.core <- subset(stepwise.core, Category == "Polysaccharides")
+
+# Make specific subsets within that object for each of the polysaccharide modules.
+sucrose.core <- subset(polysaccharide.core, ModuleName == "sucrose")
+cellobiose.core <- subset(polysaccharide.core, ModuleName == "cellobiose")
+cellulose.core <- subset(polysaccharide.core, ModuleName == "cellulose")
+chitin.core <- subset(polysaccharide.core, ModuleName == "chitin")
+pectin.core <- subset(polysaccharide.core, ModuleName == "pectin")
+trehalose.core <- subset(polysaccharide.core, ModuleName == "trehalose")
+xylan.core <- subset(polysaccharide.core, ModuleName == "xylan")
+
+
+library('eulerr')
+
+# Just for the actual polysaccharides.
+plot(euler(list(Cellulose = cellulose.core$Taxa, Chitin = chitin.core$Taxa, 
+                Pectin = pectin.core$Taxa, Xylan = xylan.core$Taxa)), shape = "ellipse",
+     quantities = TRUE)
+
+  ## CONCLUSION => between the actual polysaccharides, the greatest core overlap
+  ## appears to exist for chitin and cellulose at 12 core taxa.
+
+# plot(euler(list(Cellulose = cellulose.core$Taxa, Chitin = chitin.core$Taxa,
+#                 Pectin = pectin.core$Taxa, Xylan = xylan.core$Taxa,
+#                 Cellobiose = cellobiose.core$Taxa, Sucrose = sucrose.core$Taxa,
+#                 Trehalose = trehalose.core$Taxa)),
+#      shape = "ellipse", quantities = TRUE)
+
+# ^ Very busy, hard to draw conclusions.
+
+```
+
+# 5) Indicator genera for each module.
+
+# Includes code necessary to generate:
+- Supplemental Table 10
+
+```{r 5-indicator-genera, results = 'hide'}
+
+# Here, we're going to identify the indicator taxa.
+# Need to make an stress phyloseq object glommed by genus.
+rar.genus <- tax_glom(rar.16s, taxrank = "Genus")
+
+# Making the data frames that are the necessary components for the function.
+# Starting with the taxonomy table.
+genus.table <- data.frame(tax_table(rar.genus)[,1:6])
+genus.table$Phylum <- gsub("p__", "", genus.table$Phylum)
+genus.table$Class <- gsub("c__", "", genus.table$Class)
+genus.table$Order <- gsub("o__", "", genus.table$Order)
+genus.table$Family <- gsub("f__", "", genus.table$Family)
+genus.table$Genus <- gsub("g__", "", genus.table$Genus)
+
+# genus.table$Taxonomy <- paste(genus.table$Phylum, genus.table$Class, genus.table$Order,
+#                                       genus.table$Genus, sep = "_")
+
+
+genus.otu.table <- t(data.frame(otu_table(rar.genus))) # <- t() is there because we need to transpose species and samples for indval().
+genus.otu.table <- genus.otu.table[order(rownames(genus.otu.table)),]
+# Remove the OTUs that are zeros in all samples.
+genus.otu.table <- genus.otu.table[,!apply(genus.otu.table==0,2,all)]
+# Get the necessary metadata.
+genus.metadata <- data.frame(sample_data(rar.genus))
+genus.metadata <- genus.metadata[order(rownames(genus.metadata)),]
+
+# Make dataframes for the grouping variable and a number to assign to them.
+genus.mod.grouping <- data.frame(ModuleName = genus.metadata$ModuleName, ModuleNum = as.numeric(as.factor(genus.metadata$ModuleName)))
+genus.antibiotic.grouping <- data.frame(AntibioticName = genus.metadata$Antibiotic, AntibioticNum = as.numeric(genus.metadata$Antibiotic))
+
+# Run the indicator species for each of the factors of interest.
+ind.genus.modname <- indval(genus.otu.table, genus.mod.grouping$ModuleNum)
+
+# Now for some more in-depth analysis.
+
+# Module Name first.
+genus.gr.modname <- ind.genus.modname$maxcls[ind.genus.modname$pval<=0.05]
+genus.iv.modname <- ind.genus.modname$indcls[ind.genus.modname$pval<=0.05]
+genus.pv.modname <- ind.genus.modname$pval[ind.genus.modname$pval<=0.05]
+genus.fr.modname <- apply(genus.otu.table[,]>0, 2, sum)[ind.genus.modname$pval<=0.05]
+genus.modname.summary <- data.frame(group = genus.gr.modname, indval = genus.iv.modname, pvalue = genus.pv.modname, freq = genus.fr.modname)
+genus.modname.summary <- genus.modname.summary[order(genus.modname.summary$group, -genus.modname.summary$indval),]
+
+for(i in 1:nrow(genus.modname.summary)){
+  x <- genus.modname.summary$group[i]
+  y <- as.character(unique(genus.mod.grouping[genus.mod.grouping$ModuleNum == x, 1]))
+  genus.modname.summary$group2[i] <- y
+}
+
+# Add on the taxonomy.
+genus.modname.tax <- genus.table[rownames(genus.modname.summary),]
+genus.modname.summary <- cbind(genus.modname.summary, genus.modname.tax) # Now you can go through and look at this in more detail to see indicator genera by taxonomy.
+
+for(i in 1:nrow(genus.modname.summary)){
+  if(!grepl("_", genus.modname.summary$group2[i])){
+    genus.modname.summary$group2[i] <- paste("control_", genus.modname.summary$group2[i], sep = "")
+  }
+}
+
+genus.modname.summary$Domain <- gsub("k__", "", genus.modname.summary$Domain)
+colnames(genus.modname.summary)[colnames(genus.modname.summary) == "group2"] <- "Module Name"
+genus.modname.summary$`Module Name` <- gsub("control_", "", genus.modname.summary$`Module Name`)
+genus.modname.summary$`Module Name` <- gsub("_control", "", genus.modname.summary$`Module Name`)
+
+  ############################
+  ## Supplemental Table 10. ##
+  ############################
+
+write.table(genus.modname.summary, "final_figures/SupplementalTable10.txt", sep = "\t", col.names = NA)
+
+
+#################################################################################################
+### QUESTION => What are the indicator genera of antibiotic modules, relative to the dataset? ###
+#################################################################################################
+
+# View(genus.modname.summary)
+
+# Streptomycin indicator genera: Leifsonia, Burkholderia-Paraburkholderia, Rhodanobacter, Lactobacillus, Ca._Solibacter, Dyella, Phyllobacterium, Roseburia
+
+# Gentamicin indicator genera: Clostridium_sensu_stricto_12, Stenotrophomonas
+      
+            #################################################################################################################################################
+            ### CONCLUSION => Only streptomycin and gentamicin have indicator genera, likely b/c the others are too similar to glucose/simple substrates. ###
+            ###   Literature searches say these indicator genera are implicated in harboring resistance genes/cassettes, or even streptomycin synthesis.  ###
+            #################################################################################################################################################
+
+
+```
+
