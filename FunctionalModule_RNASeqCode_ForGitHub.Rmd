@@ -1,0 +1,1249 @@
+---
+title: "Transcriptomics Figures for Paper"
+author: "Dan Naylor"
+date: "12/31/2019"
+output: html_document
+---
+
+We supplied 15 samples of mRNA (purified through MicrobExpress kit) representing 3 replicates each of 5 functional modules:
+glucose + gentamycin, NAG, xylose, pectin, and xylan. After submitting those mRNA samples to GeneWiz, we got back
+fastq.gz files for each of those, we ran them through the BWA aligner to align them to our gff file for the Prosser soil
+(keeping sequences that aligned to the soil metagenome). Then we ran the output from that through HTSeq to get counts for 
+the individual transcripts for each sample, and normalized using DESeq2. This file uses the output from HTSeq, normalizes with DESeq2,
+and subsequently transforms it using variance-stabilizing transformation (so as to compensate for samples belonging to NAG
+or xylose having far fewer counts than those for the other three modules); it also uses annotations generated from Uniref
+and EGGNOG (KEGG Databases) to look at taxonomic or functional trends.
+
+```{r setup, include=FALSE}
+
+# Set the working directory. Customize this to be specific to wherever your working directory is.
+setwd("/Users/nayl574/Google Drive/SSFA_FY18_Consortia/amplicon-analysis/2019_09_25_danfunctionalmodules_transcriptomics/analysis/11092019_paperdraft2/")
+
+# Loading the packages we will need for this set of analyses.
+
+library('dplyr')
+library('vegan')
+library('phyloseq')
+#library('ggbiplot')
+library('ggplot2')
+library('ggfortify')
+library('gplots')
+library('stats')
+#library('clusterSim')
+library('pairwiseAdonis')
+library("matrixStats")
+library("apeglm")
+library("vsn")
+library("pheatmap")
+library("stringr")
+library("tidyr")
+library('ape')
+library('RColorBrewer')
+library('cowplot')
+library('minet')
+library('psych')
+#library('igraph')
+library('reshape2')
+library("ggpubr")
+library("ggpmisc")
+library("viridis")
+library("grid")
+library("ggplotify")
+library('reshape2')
+library("DESeq2")
+
+
+# The below two lines of code are necessary to get the taxonomy from the UniRef annotation table, later down.
+library("taxonomizr")
+prepareDatabase('accessionTaxa.sql') # <- This is necessary to get the taxonomy from the UniRef annotation table.
+# ^ Note: the accessionTaxa.sql should be in your working directory, wherever it happens to be at the moment, otherwise it will re-download. 
+# Considering it's 60 Gb in size, we don't want to redo this every time.
+
+
+theme_set(theme_bw() + theme(strip.background = element_blank()))
+
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+
+## 1) Setting up all datasets.
+
+# 1.1) Loading transcript abundance data and normalizing.
+
+Note: while we haven't done any normalization on this dataset, it has already been subsetted from the
+original dataset to only include transcripts that had a total readcount abundance across the 15 samples
+of 75 or higher. These are the transcripts for which we obtained UniRef90 and KEGG information on.
+
+
+```{r 1.1-loading-deseq-data, eval = T}
+
+######################################
+### Start by loading the raw data. ###
+######################################
+
+# We begin by importing an unnormalized counts table, specifically for the transcripts that have
+# a cumulative 75 counts across 15 samples (to reduce low-count, uninformative transcripts).
+htseq_table <- read.table("raw_data/transcriptsabove75.txt", sep = "\t",
+                          header = TRUE, row.names = 1) %>% as.data.frame()
+
+# We wish to remove low-count data and reduce the size of the dataset - our methodology for doing
+# so is to remove any transcripts for which they have more than 3 zero counts within our 15 samples.
+htseq_table <- htseq_table[rowSums(htseq_table == 0) < 4, ]
+
+# In case any counts are not integers, we need to round the values to the nearest whole number.
+htseq_table <- round(htseq_table, digits = 0)
+
+# In order to include the metadata in our DESeq data object, we need to load that in as well.
+condition_info <- read.table("raw_data/conditioninfo.txt", sep = "\t", header = TRUE, row.names = 1) %>% as.data.frame()
+
+# Now we can make a DESeq data object. This is unnormalized, we'll do that in a second.
+dds.unnorm <- DESeqDataSetFromMatrix(countData = htseq_table, colData = condition_info, design = ~ condition)
+
+# Add in factor levels. We have 15 samples from 5 modules: NAG (n-acetylglucosamine), Xylose,
+# GlucGent (glucose + gentamycin), Xylan, and Pectin. The factor levels will be in that order so as to
+# follow a roughly stepwise progression of more simple to more complex substrates.
+dds.unnorm$condition <- factor(dds.unnorm$condition, levels = c("NAG", "Xylose", "GlucGent", "Xylan", "Pectin"))
+
+dds.unnorm
+
+###############################################
+### Now we can run the DESeq normalization. ###
+###############################################
+
+## What does DESeq normalization do? It performs an analysis where it estimates size factors, estimates dispersion, then creates a 
+## negative binomial GLM fitting and Wald statistics.
+dds <- DESeq(dds.unnorm)
+# ^ Note: I'm getting an error saying that dds.unnorm doesn't have the counts data in a dataframe form.
+# ('data must be a data.frame')
+# Reinstalling the DESeq2 package seems to work to resolve that particular issue.
+
+#######################################################################################################
+### Perform variance-stabilizing transformation to minimize read-depth differences between samples. ###
+#######################################################################################################
+
+# Note: the vsd object is not used for statistical analyses, but it can be useful for visualizing differences 
+# between samples for applications such as ordination plots or heatmaps of expression patterns.
+vsd <- varianceStabilizingTransformation(dds, blind = FALSE) 
+# ^ Note: Blind = FALSE because we expect the samples to have difference in gene expression patterns
+# based on the design, and we want to do downstream analysis to fully visualize what these types of patterns might be.
+
+###########################################################################################################
+### We want to output the raw counts table and variance-stabilized counts table for archiving with GEO. ###
+###########################################################################################################
+
+# write.table(assay(dds), file = "/Users/nayl574/Desktop/Paper_1/For_GEO_Archive/raw_countstable.txt", sep = "\t", col.names = NA)
+# write.table(assay(vsd), file = "/Users/nayl574/Desktop/Paper_1/For_GEO_Archive/variancestabilized_countstable.txt", sep = "\t", col.names = NA)
+
+```
+
+
+# 1.2) Importing UniRef annotations.
+
+To the original transcript dataset with only transcripts above 75 cumulative readcounts across the 15 samples,
+we aligned these to our control soil metagenome and picked transcripts that only matched once for UniRef90 gene
+annotation. This data includes, within each transcript's 'seqid', information on the species from which the
+transcript originates. This will be useful when comparing 16s and RNA-Seq datasets.
+
+
+```{r 1.2-import-uniref-annotations-table, eval = T}
+
+# Note: Bill Nelson at PNNL generated the table for top UniRef90 hits from our transcripts.
+
+######################################################################################
+### Importing this UniRef90 annotation table and extracting taxonomic information. ###
+######################################################################################
+
+uniref.table <- read.delim("raw_data/uniref90_top_hits.txt", sep = "\t", header = FALSE) %>% as.data.frame()
+
+# Adding in the appropriate column names.
+colnames(uniref.table) <- c("qseqid", "qlen", "sseqid", "slen", "stitle", "qstart", "qend", "sstart",
+                            "send", "length", "pident", "bitscore", "evalue")
+
+# Making a separate column with just the taxonomic ID (this is part of the 'stitle' column,
+# but other information is included as well that we do not need for this analysis.) This taxonomic ID
+# can be used within the 'taxonomizr' package to obtain full taxonomic information.
+uniref.table$stitle <- as.character(uniref.table$stitle)
+uniref.table$TaxID <- str_extract(uniref.table$stitle, "TaxID=[0-9]{1,}")
+uniref.table$TaxID <- gsub("TaxID=", "", uniref.table$TaxID)
+
+# Adding in the specific Uniref function for each transcript.
+uniref.table$Function <- str_extract(uniref.table$stitle, "^?[\\s].*(?<= n=)")
+uniref.table$Function <- gsub(" n=", "", uniref.table$Function)
+uniref.table$Function <- gsub("^ ", "", uniref.table$Function)
+
+# This function is from the 'taxonomizr' package and requires you to have downloaded a dataset
+# called 'accessionTaxa.sql' containing taxonomic information by ID.
+uniref.tax <- getTaxonomy(uniref.table$TaxID, 'accessionTaxa.sql')
+rownames(uniref.tax) <- rownames(uniref.table)
+
+uniref.conjoined <- cbind(uniref.table, uniref.tax)
+rownames(uniref.conjoined) <- uniref.conjoined$qseqid
+
+# Now we've generated a table that contains comprehensive information on the UniRef annotations
+# including species of origin for all (successfully annotated) transcripts.
+
+```
+
+
+# 1.3) Importing KEGG information.
+
+```{r 1.3-import-kegg-annotations-table-with-categories-and-subcategories, eval = T}
+
+# Note: Bill Nelson at PNNL helped to generate this annotation table of transcripts containing annotations
+# for KEGG pathways using the EGGNOG database.
+
+full.keggtable <- read.delim("raw_data/transcripts_emapper_roles.tsv", sep = "\t", header = TRUE) %>% as.data.frame()
+
+
+##########################################################################
+### Making a table specifically for KEGG Categories and Subcategories. ###
+##########################################################################
+
+# Subsetting the category.table to ONLY include successfully annotated transcripts.
+category.table <- full.keggtable[-grep("^No roles", full.keggtable$PNNL.mainrole.subrole),]
+
+# Extract information on the KEGG categories and subcategories.
+category.table <- dplyr::select(category.table, seq_id = seq_id, mainrole_subrole = PNNL.mainrole.subrole) %>% as.data.frame()
+category.table[, ] <- lapply(category.table[, ], as.character)
+
+# We want to split up the 'mainrole_subrole' column - some cells contain multiple matches; we want to separate
+# it out so each row has only one mainrole/subrole, duplicating the gene names to compensate.
+# (Note that making both vectors character vectors, i.e. the previous step, is necessary for this to work.)
+
+# We're adding in a factor to divide by; if a transcript is assigned to multiple KEGG subcategories,
+# we want to partition its counts out evenly among them as opposed to replicating the counts for the
+# multiple categories.
+for(i in 1:nrow(category.table)){
+  x <- str_count(category.table$mainrole_subrole[i], "]")
+  category.table$div_factor[i] <- x
+  # if(i%%100 == 0){
+  #   print(i) # Just to keep track of how long this will take.
+  # }
+}
+
+
+# Now we're going to divide the dataframe up, splitting the subcategories across rows if there is
+# more than one for a given transcript.
+s <- strsplit(category.table$mainrole_subrole, split = "\\[")
+category.table <- data.frame(seq_id = rep(category.table$seq_id, sapply(s, length)),
+                              div_factor = rep(category.table$div_factor,sapply(s, length)),
+                              mainrole_subrole = unlist(s))
+category.table <- category.table[str_length(category.table$mainrole_subrole) != 0,]
+category.table <- separate(category.table, col = "mainrole_subrole", into = c("KEGG_Category", "KEGG_Subcategory"), sep = "\\]")
+
+# Some of the subcategories end with a comma for no discernible reason, I'll remove that as well.
+for(i in 1:nrow(category.table)){
+  if(endsWith(category.table$KEGG_Subcategory[i], ",")){
+    cat <- (category.table$KEGG_Subcategory[i])
+    x <- str_length(category.table$KEGG_Subcategory[i]) - 1
+    #print(base::substring(cat, 1, x))
+    category.table$KEGG_Subcategory[i] <- base::substring(cat, 1, x)
+  }
+}
+
+category.table <- distinct(category.table)
+
+colnames(category.table)[colnames(category.table) == "seq_id"] <- "GeneID"
+# write.table(category.table5, "New_Annotation.txt", sep = "\t", row.names = FALSE)
+
+
+################################################
+### Making a table specifically for the KOs. ###
+################################################
+
+# Subsetting the original table to just the transcripts that have KO annotations.
+ko.table <- full.keggtable[grep("^ko:", full.keggtable$KO),]
+ko.table <- dplyr::select(ko.table, seq_id = seq_id, KO = KO) %>% as.data.frame()
+ko.table[, ] <- lapply(ko.table[, ], as.character)
+
+# Adding in the division factor if there are multiple KOs per transcripts.
+for(i in 1:nrow(ko.table)){
+  x <- str_count(ko.table$KO[i], "ko:")
+  ko.table$div_factor[i] <- x
+  # if(i%%100 == 0){
+  #   print(i) # Just to keep track of how long this will take.
+  # }
+}
+
+s <- strsplit(ko.table$KO, split = "\\,")
+ko.table <- data.frame(seq_id = rep(ko.table$seq_id, sapply(s, length)),
+                              div_factor = rep(ko.table$div_factor,sapply(s, length)),
+                              KO = unlist(s))
+ko.table <- ko.table[str_length(ko.table$KO) != 0,]
+ko.table$KO <- gsub("ko:", "", ko.table$KO)
+colnames(ko.table)[colnames(ko.table) == "seq_id"] <- "GeneID"
+
+```
+
+
+
+
+# 1.4) Importing 16s Data.
+
+We want to make comparisons between the 15 samples included in this RNA-Seq dataset with their respective
+counterparts within the 16s dataset, so we will import them here and make an appropriate metadata table
+and phyloseq object.
+
+```{r loading-16s-object, eval = T}
+
+############################################################################################################
+### Importing all 16s data necessary to make a phyloseq object and adding in metadata and factor levels. ###
+############################################################################################################
+
+# Import the biom and tax information for the 16s data.
+no_meta.16s <- import_biom("raw_data/OTU.biom", "raw_data/OTU.tree")
+
+# Import the metadata.
+metadatatable.16s <- import_qiime_sample_data("raw_data/OTU_metadata.txt")
+metadatatable.16s$X <- NULL # The above function doesn't give you the option to specify rownames,
+# so you have to edit those out manually.
+
+# Merge these to create one dataset.
+unrar.16s <- merge_phyloseq(no_meta.16s, metadatatable.16s)
+
+# We want to extract out just the samples that are also in the transcriptomics dataset.
+rownames_for_subset <- c("DN_antibiotics_glc_posgentamycin_ae_2_A", "DN_antibiotics_glc_posgentamycin_ae_3_A", "DN_antibiotics_glc_posgentamycin_ae_4_A",
+                         "DN_plantsugars_n_acetylglucosamine_ae_4_B", "DN_plantsugars_n_acetylglucosamine_ae_7_B", "DN_plantsugars_n_acetylglucosamine_ae_8_B",
+                         "DN_plantsugars_pectin_ae_3_B", "DN_plantsugars_pectin_ae_4_B", "DN_plantsugars_pectin_ae_8_B",
+                         "DN_polysaccharide_xylan_NA_ae_11_plate0002", "DN_polysaccharide_xylan_NA_ae_13_plate0002", "DN_polysaccharide_xylan_NA_ae_15_plate0002",
+                         "DN_plantsugars_xylose_ae_2_B", "DN_plantsugars_xylose_ae_3_B", "DN_plantsugars_xylose_ae_4_B")
+
+# We want to create a phyloseq object that only includes the 15 samples of interest.
+unrar.16s <- subset_samples(unrar.16s, sample_names(unrar.16s) %in% rownames_for_subset)
+
+# Make the Module a factor with the same levels we'll be using for the transcriptomics dataset.
+sample_data(unrar.16s)$ModuleName <- factor(sample_data(unrar.16s)$ModuleName, levels = c("NAG", "Xylose", "GlucGent", "Xylan", "Pectin"))
+
+# Add taxonomic level names to the phyloseq tax table.
+colnames(tax_table(unrar.16s)) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+# Make sure the sample names for the phyloseq object match those for the dds object.
+sample_names(unrar.16s) <- colnames(dds)
+sample_numbers <- unlist(strsplit(colnames(dds), "_"))
+sample_numbers <- sample_numbers[c(FALSE, TRUE)]
+
+# Adding in this information on replicate, module, and module name to the phyloseq object.
+sample_data(unrar.16s)$Replicate2 <- sample_numbers
+sample_data(unrar.16s)$Module <- c(rep("GlucGent", 3), rep("NAG", 3), rep("Pectin", 3), rep("Xylose", 3), rep("Xylan", 3))
+sample_data(unrar.16s)$ModuleName <- sample_names(unrar.16s)
+sample_data(unrar.16s)$ModuleName <- factor(sample_data(unrar.16s)$ModuleName, levels = c("NAG_4", "NAG_7", "NAG_8",
+                                                                                          "Xylose_2", "Xylose_3", "Xylose_4",
+                                                                                          "GlucGent_2", "GlucGent_3", "GlucGent_4",
+                                                                                          "Xylan_11", "Xylan_13", "Xylan_15",
+                                                                                          "Pectin_3", "Pectin_4", "Pectin_8"))
+
+sample_data(unrar.16s)$Module <- factor(sample_data(unrar.16s)$Module, levels = c("NAG", "Xylose", "GlucGent", "Xylan", "Pectin"))
+
+otu_table(unrar.16s) <- otu_table(unrar.16s)[,levels(sample_data(unrar.16s)$ModuleName)] 
+# ^ We want the otu table to be in the same order as the order of module levels.
+
+###############################################################
+### Rarefying the 16s dataset to be of even sampling depth. ###
+###############################################################
+
+# Rarefy the meta16s.2 data object as we've done for the main 16s code.
+rar.16s <- rarefy_even_depth(unrar.16s, rngseed = 711, sample.size = 5000) 
+# ^ Note: this rarefaction depth is lower than that for the main 16s analysis: this is because in the latter
+# dataset, the rarefaction depth used excluded one pectin sample included in this analysis, and we wish to
+# retain it here to make all possible comparisons between RNA-Seq and 16s data.
+
+
+```
+
+
+## 2) Comparing 16s and RNA-Seq Datasets.
+
+
+```{r making-metadata, eval = T}
+
+#####################################################################################################################
+### Making a dataframe for metadata for which we will base our subsequent 16s and transcriptomics comparisons on. ###
+#####################################################################################################################
+
+metadata.comparisons <- data.frame(sample_data(rar.16s)) %>% dplyr::select(., ModuleName, Module, Replicate = Replicate2)
+
+
+```
+
+
+# 2.1) Making distance objects.
+
+In order to compare the 16s and RNA-Seq datasets and how samples cluster within each, we're going to use Bray-Curtis
+dissimilarity as a distance metric (as opposed to Weighted Unifrac, which was used for the main 16s dataset analyses,
+as RNA-Seq by nature does not have any phylogenetic tree that would be required for Weighted Unifrac).
+
+
+```{r 2.1-making-bray-curtis-distance-objects, eval = T}
+
+##############################################################
+### Making Bray-Curtis distance objects for both datasets. ###
+##############################################################
+
+# Note: we're using the variance-stabilized RNA-Seq object for Bray-Curtis; however, the vsd object contains negative values
+# and Bray-Curtis is incompatible with negative values. Because those values are very small (between 0 and -1)
+# and rare, we'll transform them to simply be zero counts. The influence on the distances should be negligible.
+counts.tr <- assay(vsd)
+counts.tr <- replace(counts.tr, counts.tr[,] < 0, 0)
+counts.tr <- t(counts.tr) # <- for the vegdist function, we need transcripts to be columns and samples to be rows. 
+
+# Generate the distance object for the transriptomics dataset.
+bray.tr <- vegdist(counts.tr, "bray")
+
+# Generate the distance object for the 16s dataset.
+bray.16s <- vegdist(t(otu_table(rar.16s)), "bray")
+
+```
+
+
+# 2.2) PERMANOVA and Beta-dispersion tests.
+
+This code block includes the code necessary to generate:
+- Supplemental Table 12
+
+```{r 2.2-permanova-and-beta-dispersion, eval = T}
+
+###########################################################################################################
+### Running PERMANOVA to determine whether 'Module' and 'Replicate' are significant for either dataset. ###
+###########################################################################################################
+
+  ############################
+  ## Supplemental Table 12. ##
+  ############################
+
+permanova.16s <- adonis(bray.16s ~ Module + Replicate, data = metadata.comparisons)
+# permanova.16s[[1]] %>% View()  # <- Shows that Module is a significant factor in explaining variation in Bray-Curtis distance for the 16s dataset, while Replicate is not.
+
+permanova.tr <- adonis(bray.tr ~ Module + Replicate, data = metadata.comparisons)
+# permanova.tr[[1]] %>% View()  # Also shows that Module is significant while Replicate is not, this time for the transcriptomics dataset.
+
+####################################################################################################
+### Running beta-dispersion tests to see if variance is significantly different between modules. ###
+####################################################################################################
+
+disp.bray.16s <- betadisper(bray.16s, metadata.comparisons$Module)
+permutest(disp.bray.16s, pairwise = TRUE, permutations = 999)
+# On the whole, 'Module' is not significant for explaining variation in beta-dispersion in the 16s dataset;
+# however, there are significant differences between NAG <-> Xylose and NAG <-> Pectin.
+
+disp.bray.tr <- betadisper(bray.tr, metadata.comparisons$Module)
+permutest(disp.bray.tr, pairwise = TRUE, permutations = 999)
+# For the transcriptomics datasets, there are no significant differences in beta-dispersion between modules.
+
+
+```
+
+# 2.3) Mantel's test
+
+One question of interest is whether there exists a correlation in the pairwise distances between samples
+for RNA-Seq and 16s data - that is, if samples are more dissimilar with respect to taxonomic profiles, are
+they in fact more dissimilar for functional ones? And if so, is this correlation significant.
+
+One way to conduct such an analysis is through a Mantel's test, in which two pairwise matrices are directly compared
+to one another and significance of any correlation between the two is calculated.
+
+```{r 2.3-mantels-test-16s-vs-RNA-Seq, eval = T}
+
+######################################################################
+### Mantel's test for pairwise similarity between 16s and RNA-Seq. ###
+######################################################################
+
+# Initializing a dataframe in which to contain information from the Mantel's test.
+mantels<-data.frame(test = character(),Mstat = numeric(),signif = numeric())
+
+# Running the mantel function, which is within the vegan package.
+mantel_bray <-vegan::mantel(bray.16s, bray.tr, method="pearson",permutations=9999,strata=NULL)
+
+mantels<-rbind(mantels, data.frame(test=c("Bray Transcriptomics vs Bray 16S"),Mstat=mantel_bray$statistic,signif=mantel_bray$signif))
+# mantels # Demonstrates that this correlation is in fact significant at p = 0.0001.
+
+```
+
+
+## 3) Ordination plots through principal coordinate analysis.
+
+Here, we want to investigate at how samples cluster for 16s and RNA-Seq datasets. Are samples
+generally similar to other replicates for a given module, or are there differences? How to RNA-Seq
+and 16s datasets compare to one another?
+
+```{r 3.1-pcoa-plots, fig.height = 4, fig.width = 4, eval = T}
+
+########################################################################
+### Constructing an ordination plot for the transcriptomics dataset. ###
+########################################################################
+
+# We want to use the plot_ordination function to plot the ordinations, so we need to make a phyloseq object.
+phy.tr.otu <- otu_table(counts.tr, taxa_are_rows = FALSE)
+phy.tr.sample <- sample_data(metadata.comparisons)
+
+phy.tr <- merge_phyloseq(phy.tr.otu, phy.tr.sample)
+pcoa.tr <- ordinate(phy.tr, method = "PCoA", distance = "bray")
+
+# Make the ordination plot.
+bray.tr.plot <- plot_ordination(phy.tr, pcoa.tr, color = "Module", title = "RNA-Seq Principal Coordinate Analysis - Bray Curtis\n") +
+  geom_point(size = 6, color = "black") + geom_point(size = 5, inherit.aes = TRUE) + scale_color_manual(values =  brewer.pal(5, "Spectral")) +
+  theme(legend.text = element_text(size = 14), plot.title = element_text(size = 20, face = "bold"))
+
+bray.tr.plot
+
+############################################################
+### Constructing an ordination plot for the 16s dataset. ###
+############################################################
+
+pcoa.16s <- ordinate(rar.16s, method = "PCoA", distance = "bray")
+
+bray.16s.plot <- plot_ordination(rar.16s, pcoa.16s, color = "Module", title = "16s PCoA\n") +
+  geom_point(size = 6, color = "black") + geom_point(size = 5, inherit.aes = TRUE) + scale_color_manual(values = brewer.pal(5, "Spectral")) +
+  theme(legend.text = element_text(size = 14), plot.title = element_text(size = 20, face = "bold"))
+
+
+bray.16s.plot
+
+# pcoa.concatenated <- plot_grid(bray.tr.plot, bray.16s.plot, ncol = 2)
+# # save_plot("../../analysis/10212019_figsforpaper/PCoA/braytr_bray16s.pdf", plot = pcoa.concatenated, ncol = 1, base_width = 8, base_height = 4, scale = 1.5)
+
+
+```
+
+## 4) Comparing taxonomic information for 16s and RNA-Seq datasets.
+
+We want to compare the taxonomies we obtained from the Uniref annotations to those from the 16s data. Does RNA-Seq
+represent a methodology for getting a more diverse relative abundance plot, one that is more reflective of the soil diversity?
+
+
+# 4.1) Getting taxonomic information from transcripts.
+
+```{r 4.1-match-tax-to-deseq, eval = T}
+
+#################################################################
+### Obtaining taxonomic information from our RNA-Seq dataset. ###
+#################################################################
+
+# We want to be sure that we're only retaining transcripts that actually have taxonomic information
+# for them, as not all transcripts were successfully annotated using UniRef90.
+
+# Making a copy of the transcriptomic phyloseq object for this code block.
+# Note: we aren't using the variance-stabilizing transformation for this particular plot, as
+# we want to be able to accurately visualize the differences between samples.
+phy.tr.tax <- merge_phyloseq(otu_table(counts(dds, normalized = TRUE), taxa_are_rows = TRUE), sample_data(metadata.comparisons))
+# phy.tr.tax <- rarefy_even_depth(phy.tr.tax, rngseed = 711) # Don't want to rarefy here.
+
+# Subsetting the otu table of this new phyloseq object to ONLY include transcripts that have UniRef annotations.
+otu_table(phy.tr.tax) <- (otu_table(phy.tr.tax))[rownames(otu_table(phy.tr.tax)) %in% rownames(uniref.conjoined),]
+rownames(otu_table(phy.tr.tax)) <- as.character(rownames(otu_table(phy.tr.tax)))
+
+# Making a dataframe of the taxonomic information for just the transcripts we have in the phy.tr.tax object.
+tax_toadd <- tax_table(uniref.conjoined[rownames(otu_table(phy.tr.tax)),16:22])
+rownames(tax_toadd) <- as.character(uniref.conjoined[rownames(otu_table(phy.tr.tax)),1])
+
+# Merge this into the phyloseq object.
+phy.tr.tax <- merge_phyloseq(phy.tr.tax, tax_toadd)
+colnames(tax_table(phy.tr.tax)) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+# Note: because the 16s dataset should only include sequences from bacterial or archaeal taxa,
+# and we want to make accurate comparisons between the 16s and RNA-Seq, we need to remove Eukaryotic or NA
+# sequences from this phyloseq object.
+phy.tr.tax <- subset_taxa(phy.tr.tax, Domain != "Eukaryota" & !is.na(Domain))
+
+```
+
+
+# 4.2) Obtaining phylum level abundance counts.
+
+This code block (and the previous one as well) contain
+the contain necessary to generate:
+- Supplemental Figure 3
+
+```{r 4.2-phylum-level-relabundance-readlevel, fig.height = 4, fig.width = 12}
+
+##############################################################
+### Function for generating tables for count data by taxa. ###
+##############################################################
+
+# We can quickly customize our relative abundance graphs to any taxonomic level or number of top taxa
+# that we want using the below functions. In these plots I'll be using the top 13 phyla rather than top 10
+# (so as to more fully reflect diversity that would be found in the RNA-Seq dataset).
+
+relabundance_melttable <- function(phy, n = 10, rank = "Phylum"){
+  
+  # Determine what the top n phyla are. Doing 'n+1' in order to capture the unknown ('?') phylum.
+  top_taxa <- as.list(sort(tapply(taxa_sums(phy), tax_table(phy)[,rank], sum), TRUE)[1:(n+1)]) %>% names()
+ 
+  # If one of the top_taxa is unknown, we want to remove it from this list.
+  top_taxa <- top_taxa[top_taxa != "\\?"]
+  
+  # If not, we want to remove the extra element so we only have n elements in this list.
+  if(length(top_taxa) > n){
+    top_taxa <- top_taxa[1:(length(top_taxa) - 1)]
+  }
+  print(top_taxa)
+  
+  # Rename the taxa that aren't in the top n to just be "Other".
+  tax_table(phy)[!tax_table(phy)[,rank] %in% top_taxa,rank] <- "Other"
+
+  tax_table(phy)[,rank] <- factor(tax_table(phy)[,rank], levels = c(top_taxa, "Other")) %>% as.character()
+
+  # In order for us to glom successfully, we need to remove the columns prior to the taxrank we're using. E.g. if using 'Class',
+  # we need to remove 'Domain' and 'Phylum'.
+  tax_table(phy) <- tax_table(phy)[,which(colnames(tax_table(phy)) == rank):length(colnames(tax_table(phy)))]
+  
+  phy.glom <- tax_glom(phy, taxrank = rank)
+
+  taxa_names(phy.glom) <- tax_table(phy.glom)[,rank]
+  
+  if(taxa_are_rows(phy.glom) == TRUE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), data.frame(t(otu_table(phy.glom))))
+  }
+  
+  if(taxa_are_rows(phy.glom) == FALSE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), data.frame(otu_table(phy.glom)))
+  }
+  
+  if("Replicate" %in% colnames(glom.table)){
+    glom.table$Replicate <- as.character(glom.table$Replicate)
+  }
+  
+  glom.melt <- melt(data = glom.table, value.name = "Abundance", variable.name = rank)
+
+  # Relevel the taxrank so 'Other' is last.
+  glom.melt[,rank] <- factor(glom.melt[,rank], levels = c(sort(top_taxa), "Other"))
+  
+  # Remove any NAs.
+  glom.melt <- glom.melt[!is.na(glom.melt[,rank]),]
+  
+  # If the taxa is labeled with a prefix (e.g. p__Proteobacteria rather than Proteobacteria),
+  # we can get rid of that here.
+  glom.melt[,rank] <- gsub("^.__", "", glom.melt[,rank])
+  
+  return(glom.melt)
+}
+
+phy.tr.melt <- relabundance_melttable(phy.tr.tax, n = 13, rank = "Phylum")
+rar.16s.melt <- relabundance_melttable(rar.16s, n = 13, rank = "Phylum")
+
+phy.tr.melt$DataType <- "RNA-Seq"
+rar.16s.melt$DataType <- "16S"
+
+# Conjoin these two objects together so 16s and RNA-Seq data are in the same object.
+total.melt <- rbind(dplyr::select(phy.tr.melt, ModuleName, Phylum, Abundance, DataType),
+                    dplyr::select(rar.16s.melt, ModuleName, Phylum, Abundance, DataType))
+total.melt <- separate(total.melt, col = ModuleName, into = c("Module", "Replicate"), remove = FALSE)
+
+
+# Relevel Phylum to be in the right order.
+phy_levels <- c("Gemmatimonadetes", "Bacteroidetes", "Actinobacteria", "Elusimicrobia", "Firmicutes", "Planctomycetes", "Acidobacteria",
+                "Chloroflexi", "Proteobacteria", "Verrucomicrobia", "Cyanobacteria", "Thermotogae", "Other") 
+total.melt$Phylum <- factor(total.melt$Phylum, levels = phy_levels)
+total.melt$Module <- factor(total.melt$Module, levels = c("NAG", "Xylose", "GlucGent", "Xylan", "Pectin"))
+total.melt$DataType <- factor(total.melt$DataType, levels = c("RNA-Seq","16S"))
+
+###########################################
+### Making a plot of the melted object. ###
+###########################################
+
+comparison_plot <- ggplot(data=total.melt,aes(x=Replicate,y=Abundance,fill=Phylum)) + 
+  geom_bar(stat="identity", position = "fill") + 
+  facet_wrap( ~ Module + DataType, scales = "free_x", nrow=1) +
+  # scale_fill_manual(values = c25) +
+  scale_fill_manual(values = c(brewer.pal(10,"Spectral"), viridis(5)[c(1,3)], "grey34"), drop = FALSE) +
+  theme(axis.text.x=element_text(size=10,color="black"), axis.text.y=element_text(size=16,color="black"),
+        axis.title=element_text(size=16,face="bold"),text=element_text(size=16), plot.title = element_blank(),
+        legend.title = element_text(size = 20)) +
+  ylab("Relative Abundance\n") +
+  theme(legend.text = element_text(size = 18), plot.title = element_text(size = 24, face = "bold")) + theme(panel.spacing = unit(1, "lines"))
+  
+comparison_plot
+
+# ggsave("../../../2019_07_31_danfunctionalmodules_OTUs/111119_draft2/final_figures/SupplementalFigure_3.pdf", plot = comparison_plot, height = 6, width = 18)
+
+```
+
+
+## 5) Heatmaps.
+
+# 5.1) Heatmap of gene expression patterns.
+
+Here, we're creating a heatmap for expression of the 500 genes
+with a combination of highest coefficient of variation and the highest
+readcounts.
+
+
+```{r 5.1-heatmap, fig.height = 6, fig.width = 4}
+
+##############################################################################
+### Creating a dataframe with the 500 genes with highest counts/variation. ###
+##############################################################################
+
+
+# To determine which genes/transcripts have the highest coefficient of variation, we're going to make a dummy dataframe,
+# and calculate the row means, row standard deviations, and coefficient of variation (sd / mean * 100).
+df.vsd <- as.matrix(assay(vsd))
+df.vsd <- cbind(df.vsd, Means = rowMeans(df.vsd), StDev = rowSds(df.vsd), Sums = rowSums(df.vsd)) %>% as.data.frame()
+df.vsd$CoVar <- df.vsd$StDev / df.vsd$Means * 100
+
+# Re-order the dummy dataframe by decreasing coefficient of variation. We're going to
+# subset to the 5000 genes with the highest row means, then the top 500 of those for
+# coefficient of variation.
+df.byMean <- df.vsd[order(-df.vsd$Means),]
+df.byMean <- df.byMean[1:5000,]
+df.byMeanandCovar <- df.byMean[order(-df.byMean$CoVar),]
+# View(df.byMeanandCovar)
+
+# Making a dataframe where instead of it being the DESeq value it's the difference
+# between the DESeq value and the average value for that transcript, for easier graphing.
+vsd.toavg <- assay(vsd)
+vsd.toavg <- vsd.toavg - rowMeans(vsd.toavg)
+
+# Now subset this object to just the 5000 with the highest rowmeans / coefficient of variation.
+vsd.toavg.500.byMeanandCovar <- vsd.toavg[rownames(vsd.toavg) %in% rownames(df.byMeanandCovar)[1:500],]
+
+# pheatmap(vsd.toavg.500.byMeanandCovar[1:500,], show_rownames = FALSE, cluster_rows = TRUE, cluster_cols = FALSE)
+
+##################################
+### Generate the heatmap plot. ###
+##################################
+
+heatmap_top500 <- pheatmap(vsd.toavg.500.byMeanandCovar[1:500,], show_rownames = FALSE, cluster_rows = TRUE, cluster_cols = FALSE,
+         legend_breaks = c(-5, 0, 5, 10, 15, max(vsd.toavg.500.byMeanandCovar[1:500,])),
+         legend_labels = c("-5", "0", "5","10","15", "Distance\n"), main = "Variance-Stabilized Distance from Average Transcript Expression Level\n")
+heatmap_top500
+
+# ggsave("heatmap_top500.jpg", plot = heatmap_top500, width = 6, height = 4)
+
+
+```
+
+
+# 5.2) Heatmap of sample-to-sample distances.
+
+```{r sample-to-sample-heatmap, fig.height = 4, fig.width = 4}
+
+#######################################################################
+### Constructing a heatmap between samples to see how they cluster. ###
+#######################################################################
+
+sampleDists.vsd <- dist(t(as.matrix(assay(vsd))), method = "euclidean")
+sampleDists.vsd.matrix <- as.matrix(sampleDists.vsd)
+# The dist() function computes and returns a distance matrix using euclidean distance (as a default, can be changed).
+
+# colnames(sampleDists.vsd) <- NULL
+colors <- colorRampPalette(rev(brewer.pal(11, "RdYlBu")) )(255)
+
+pairwiseheatmap <- pheatmap(sampleDists.vsd.matrix, clustering_distance_rows=sampleDists.vsd, clustering_distance_cols=sampleDists.vsd,
+           col=colors, main = "Sample to Sample Euclidean Distances\n", width = 6, height = 5)
+
+
+```
+
+
+# 5.4) Constructing Figure 6.
+
+Figure 6 will consist of four components: 
+
+A) RNA-Seq PCoA graph
+B) 16S PCoA graph
+C) Sample-to-sample heatmap
+D) Top 500 gene expression heatmap
+
+Parts A - C will be one column on the left-hand side, part D will be on the right.
+
+
+```{r consolidating-figures-for-presentation, fig.height = 10, fig.width = 6}
+
+part_6a <- plot_ordination(phy.tr, pcoa.tr, color = "Module", title = "RNA-Seq Principal Coordinate Analysis") +
+  geom_point(size = 5, color = "black") + geom_point(size = 4, inherit.aes = TRUE) + scale_color_manual(values =  brewer.pal(5, "Spectral")) +
+  theme(legend.text = element_text(size = 10), plot.title = element_text(size = 12, face = "bold"))
+
+
+part_6b <- plot_ordination(rar.16s, pcoa.16s, color = "Module", title = "\n16S Principal Coordinate Analysis") +
+  geom_point(size = 5, color = "black") + geom_point(size = 4, inherit.aes = TRUE) + scale_color_manual(values = brewer.pal(5, "Spectral")) +
+  theme(legend.text = element_text(size = 10), plot.title = element_text(size = 12, face = "bold"))
+
+part_6c <- pheatmap(sampleDists.vsd.matrix, clustering_distance_rows=sampleDists.vsd, clustering_distance_cols=sampleDists.vsd,
+                    col=colors, width = 6, height = 5, main = "",
+                    legend_breaks = c(0, 100, 200, 300, 400, 500, 600, max(sampleDists.vsd.matrix)),
+                    legend_labels = c("0", "100", "200", "300", "400", "500", "600", "Distance\n"))
+
+part_6d <- pheatmap(vsd.toavg.500.byMeanandCovar[1:500,], show_rownames = FALSE, cluster_rows = TRUE, cluster_cols = FALSE, main = "",
+                    legend_breaks = c(-5, 0, 5, 10, 15, max(vsd.toavg.500.byMeanandCovar[1:500,])),
+                    legend_labels = c("-5", "0", "5","10","15", "Distance\n"))
+
+
+parts_6abc <- plot_grid(part_6a, part_6b, as.grob(part_6c), ncol = 1, rel_heights = c(0.95, 1, 1.25), labels = c("a)", "b)", "c)"))
+full_plot <- plot_grid(parts_6abc, as.grob(part_6d), ncol = 2, labels = c("", "d)"), hjust = 0.5)
+full_plot
+
+# save_plot("../../../2019_07_31_danfunctionalmodules_OTUs/111119_draft2/final_figures/Figure_6.pdf", plot = full_plot, ncol = 1, base_width = 12, base_height = 13.5, scale = 1)
+ 
+
+```
+
+
+## 6) Looking for enriched genes.
+
+# 6.1) Generating lists of all enriched genes through pairwise comparisons.
+
+Usually RNA-Seq analyses would include a control against which to judge if a transcript is enriched
+in a certain condition or not. However, our experimental design includes 3 replicates each of 5 functional
+module communities, and as such none of them represents a 'control'. So instead the methodology we will
+be using is to compare each module to all remaining factors, individually, and see commonalities in enrichment
+patterns across all those combinations.
+
+```{r 6.1-all-pairs-comparisons, warning = F, results = 'hide'}
+
+##############################################################################################
+### Making a function to generate enrichment trends for a given module against all others. ###
+##############################################################################################
+
+factors <- c("NAG", "Xylose", "GlucGent", "Xylan", "Pectin")
+
+
+allpairs_enrichedgenes <- function(dds, factor_list = factors, main_factor = "NAG"){
+  
+  # Making a second factor list that represents all the factors against which we wish to compare
+  # our main factor.
+  factor_list2 <- factor_list[factor_list != main_factor]
+  
+  # Initialize the results datafgrame.
+  to_return <- as.data.frame(matrix(ncol = 9, nrow = 0))
+  colnames(to_return) <- c("baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "names", "ModuleID", "Direction")
+                             
+  for(contrasting_factor in factor_list2){
+    dds.res <- results(dds, contrast = c("condition", main_factor, contrasting_factor))
+    
+    # Shrink log-fold changes accordingly using lfcShrink function.
+    res.lfc <- lfcShrink(dds, res = dds.res, contrast = c("condition", main_factor, contrasting_factor))
+    res.lfc$names <- rownames(res.lfc)
+    
+    # Get up- and down-regulated genes.
+    res.lfc.up <- res.lfc[which(res.lfc$padj < 0.05 & res.lfc$log2FoldChange > 1),]
+    res.lfc.up$ModuleID <- paste(main_factor, "EnrichedRelativeTo", contrasting_factor, sep = "_")
+    res.lfc.up$Direction <- "Up"
+    
+    res.lfc.down <- res.lfc[which(res.lfc$padj < 0.05 & res.lfc$log2FoldChange < -1),]
+    res.lfc.down$ModuleID <- paste(main_factor, "DepletedRelativeTo", contrasting_factor, sep = "_")
+    res.lfc.down$Direction <- "Down"
+    
+    to_return <- rbind(to_return, res.lfc.up, res.lfc.down)
+  }
+  
+  # We will be returning a dataframe that includes information on the log2 fold change, the p-value,
+  # the transcript ID, the module ID, and the directionality of the shift.
+  return(to_return)
+}
+
+nag_allpairs <- allpairs_enrichedgenes(dds, factor_list = factors, main_factor = "NAG")
+
+xylose_allpairs <- allpairs_enrichedgenes(dds, factor_list = factors, main_factor = "Xylose")
+
+glucgent_allpairs <- allpairs_enrichedgenes(dds, factor_list = factors, main_factor = "GlucGent")
+
+xylan_allpairs <- allpairs_enrichedgenes(dds, factor_list = factors, main_factor = "Xylan")
+
+pectin_allpairs <- allpairs_enrichedgenes(dds, factor_list = factors, main_factor = "Pectin")
+
+# Now we have all enrichment trends for all pairwise comparisons for all modules.
+
+##################################################################################################################
+### Creating objects with up- or down-regulated genes in modules that have fewer than n 0's across 15 samples. ###
+##################################################################################################################
+
+# Important note: this takes as one of the inputs the KEGG table ('category.table' data object) generated
+# in code block 1.3, so regenerate that if not present.
+
+allpairs_annotating <- function(df, dir = "Up", na = 3, kegg.table = category.table5){
+  
+  # This function takes as input one of the 'all_pairs' data objects generated above.
+  # We start by extracting only the direction ('Up' or 'Down') we're interested in.
+  df.dir <- as.data.frame(subset(df, df$Direction == dir))
+  
+  df.dir.cast <- dcast(df.dir, names ~ ModuleID, value.var = "padj")
+  
+  # We will remove transcripts that have NA values (not be enriched) in fewer than 'na' comparisons.
+  # We want enriched transcripts in a module to be enriched relative to at least 2 other modules, so in this
+  # case our value for 'na' will be 3.
+  df.dir.cast <- df.dir.cast[rowSums(is.na(df.dir.cast)) < na, ]
+  rownames(df.dir.cast) <- as.character(df.dir.cast$names)
+  
+  df.kegg <- kegg.table[kegg.table$GeneID %in% df.dir.cast$names, c(1,3:4)]
+  df.kegg$GeneID <- as.character(df.kegg$GeneID)
+  df.dir.kegg <- df.dir.cast[df.kegg$GeneID,]
+  
+  df.final <- cbind(df.kegg, df.dir.kegg)
+  
+  # We could return df.final at this point, but I want to turn it into a form that I can then use.
+  mod.id <- unlist(strsplit(df.dir$ModuleID[1], "Relative"))[1]
+  
+  df.toreturn <- data.frame(GeneID = df.final$GeneID, ModuleID = mod.id)
+  return(df.toreturn)
+}
+
+nag.upfinal <- allpairs_annotating(df = nag_allpairs, dir = "Up", na = 3, kegg.table = category.table)
+nag.downfinal <- allpairs_annotating(df = nag_allpairs, dir = "Down", na = 3, kegg.table = category.table)
+
+xylose.upfinal <- allpairs_annotating(df = xylose_allpairs, dir = "Up", na = 3, kegg.table = category.table)
+xylose.downfinal <- allpairs_annotating(df = xylose_allpairs, dir = "Down", na = 3, kegg.table = category.table)
+
+glucgent.upfinal <- allpairs_annotating(df = glucgent_allpairs, dir = "Up", na = 3, kegg.table = category.table)
+glucgent.downfinal <- allpairs_annotating(df = glucgent_allpairs, dir = "Down", na = 3, kegg.table = category.table)
+
+xylan.upfinal <- allpairs_annotating(df = xylan_allpairs, dir = "Up", na = 3, kegg.table = category.table)
+xylan.downfinal <- allpairs_annotating(df = xylan_allpairs, dir = "Down", na = 3, kegg.table = category.table)
+
+pectin.upfinal <- allpairs_annotating(df = pectin_allpairs, dir = "Up", na = 3, kegg.table = category.table)
+pectin.downfinal <- allpairs_annotating(df = pectin_allpairs, dir = "Down", na = 3, kegg.table = category.table)
+
+# Now, we have a list of all the transcripts that are enriched or depleted, in at least 2 of 4 comparisons, for
+# all five of our modules; this includes their GeneIDs (used for getting annotations from the KEGG table and
+# to determine if a specific KEGG Category or Subcategory is disproportionately represented amongst these enrichments).
+
+```
+
+# 6.2) Determining enrichment patterns for KEGG Categories or Subcategories.
+
+This code block includes the code necessary to generate:
+- Supplemental Table 12
+
+```{r 6.2-categoryorsubcategory-enrichment-trends}
+
+# This code was obtained from Ryan McClure at PNNL, and uses Fisher's exact test to determine if
+# a given KEGG Category or Subcategory is disproportionately represented 
+
+moduleCategoryEnrichment <- function(ko_dataframe = category.table, module_enrichment = annotated.list, level = "KEGG_Category"){
+  
+  #between the quotes in the line below put the full file path name of the file with the gene names of the group you are interested in
+  #The "ModuleID" column is the name of the group that you are interested in, "Genes showing changes with iron at 1 hour" for example
+  #The "GeneID" column contains all the genes (locus tags) in that group
+  
+  # This contains information of the transcript/gene IDs (GeneID) with the module ID (e.g. NAG or GlucGent);
+  # presumably GeneID can show up more than once if it is significantly associated with more than one module.
+  moduleData <- module_enrichment
+  
+  # This annotData object holds the KO information for all of my unique transcripts.
+  annotData <- ko_dataframe
+  
+  fModuleData <- moduleData
+  fAnnotData <- annotData[, c("GeneID", level)]
+  colnames(fAnnotData) <- c("GeneID", level)
+  
+  # Gets the unique KEGG categories and Module IDs.
+  uniqueFunCats <- unique(fAnnotData[c(level)])
+  
+  KEGGs <- unique(fAnnotData[,level])
+  modules <- unique(fModuleData$ModuleID)
+  
+  # How many unique genes/transcripts in our ANNOTATED DATASET we have that have KEGG annotations? 
+  # I.e. not just the genes that showed up significantly up- or down-regulated, but in our WHOLE dataset that
+  # we bothered to get annotations for.
+  numGenesInGenome <- nrow(fAnnotData)
+  
+  outputData <- NULL
+  
+  for (mID in modules)
+  {
+    # We have 5 (6 if using "Mean") unique module IDs (mIDs) that we will run this analysis on.
+    # Just getting the enrichment trends for that specific module.
+    genesInSet <- fModuleData[fModuleData$ModuleID == mID, "GeneID"]
+    
+    # How many enriched genes are there for this specific module?
+    numGenesInSet <- length(genesInSet)
+    
+    for (i in 1:nrow(uniqueFunCats))
+    {
+      # Now we're considering the individual KEGG categories to see if our module is associated with that specific category.
+      KEGGs <- uniqueFunCats[i, level]
+      
+      # Of all the genes in our annotated dataset (NOT our enriched module genes) how many belong to this specific KEGG Category?
+      genesInGenomeWithAnnot <- fAnnotData[fAnnotData[,level] == KEGGs, "GeneID"]
+      numGenesInGenomeWithAnnot <- length(genesInGenomeWithAnnot)
+      
+      # Of our genes enriched in this particular module, how belong to the particular KEGG category we're investigating?
+      numGenesInSetWithAnnot <- length(intersect(genesInSet, genesInGenomeWithAnnot))
+      
+      #=====================================================================================
+      # Run Fisher's exact test
+      
+      counts <- matrix(c(numGenesInSetWithAnnot, numGenesInSet-numGenesInSetWithAnnot,
+                         numGenesInGenomeWithAnnot, numGenesInGenome-numGenesInGenomeWithAnnot), nrow=2)
+      res <- fisher.test(counts)
+       if (res$p.value <= 0.05)
+      {
+        pModule <- numGenesInSetWithAnnot/numGenesInSet
+        pGenome <- numGenesInGenomeWithAnnot/numGenesInGenome
+        
+        ratio <- pModule/pGenome
+        
+         if (pModule > pGenome)
+        {
+          outputData <- rbind(outputData, cbind(ModuleID=mID, KEGG_Category=KEGGs, PVal=res$p.value, Ratio=ratio, PercentageInModule=pModule, PercentageInGenome=pGenome)) 
+        }
+      }
+      
+      #=======================================================================================
+    }
+  }
+  
+  #between the quotes in the line below put the full file path name of where you want the results to appear
+  print(head(outputData))
+  # outputFilePath <- "E:/Fur_Grant/Work/GC_Network_Paper/Resubmission/New_GBA_Annotated_Genes_75.csv"
+  # write.table(outputData, file=outputFilePath, quote=FALSE, sep=",", row.names=FALSE, col.names=TRUE)
+  return(outputData)
+}
+
+
+# Continuing on from a few code blocks prior, we're going to use the allpair comparison data objects along with Ryan's code
+# to get enrichment patterns for each of these data objects.
+
+all.upfinal <- rbind(nag.upfinal, xylose.upfinal, glucgent.upfinal, xylan.upfinal, pectin.upfinal)
+all.downfinal <- rbind(nag.downfinal, xylose.downfinal, glucgent.downfinal, xylan.downfinal, pectin.downfinal)
+
+allpairs.up.cat <- as.data.frame(moduleCategoryEnrichment(ko_dataframe = category.table, module_enrichment = all.upfinal, level = "KEGG_Category"))
+allpairs.up.subcat <- as.data.frame(moduleCategoryEnrichment(ko_dataframe = category.table, module_enrichment = all.upfinal, level = "KEGG_Subcategory"))
+
+allpairs.down.cat <- as.data.frame(moduleCategoryEnrichment(ko_dataframe = category.table, module_enrichment = all.downfinal, level = "KEGG_Category"))
+allpairs.down.subcat <- as.data.frame(moduleCategoryEnrichment(ko_dataframe = category.table, module_enrichment = all.downfinal, level = "KEGG_Subcategory"))
+
+
+  ##############################
+  ### Supplemental Table 12. ###
+  ##############################
+
+# Write all of these to a text file we will then concatenate to form the supplemental table.
+
+# write.table(allpairs.up.cat, file = "KEGG_cats_regulation/upcat.txt", quote = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+# 
+# write.table(allpairs.up.subcat, file = "KEGG_cats_regulation/upsubcat.txt", quote = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+# 
+# write.table(allpairs.down.cat, file = "KEGG_cats_regulation/downcat.txt", quote = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+# 
+# write.table(allpairs.down.subcat, file = "KEGG_cats_regulation/downsubcat.txt", quote = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+
+```
+
+# 6.3) Generating tables of enriched KOs for iPath.
+
+iPath is an online tool that allows you to visualize trends for exactly where on a metabolic map
+a group of transcripts is associated with. We have previously generated tables of the enriched or
+depleted transcripts for our modules in section 6.1, now we are going to relate that information back
+to the individual KOs using the reference KO table generated in section 1.3.
+
+```{r 6.3-extracting-enriched-KOs-for-iPath, eval = T, warning = F}
+
+####################################################################
+### Generating tables for enriched/depleted KOs for each module. ###
+####################################################################
+
+generate_ko_table <- function(module.table, ko.table = ko.table){
+  enrichment_type <- module.table$ModuleID[1]
+  full.table <- ko.table[ko.table$GeneID %in% module.table$GeneID, colnames(ko.table) == "KO"]
+  
+  # Write this to a text file for use in iPath.
+  filepath <- paste("iPath_KOs/", enrichment_type, ".txt", sep = "")
+  write.table(full.table, filepath, sep = "\t", row.names = FALSE, col.names = FALSE)
+}
+
+# Write KO tables for NAG.
+generate_ko_table(module.table = nag.upfinal, ko.table = ko.table)
+generate_ko_table(module.table = nag.downfinal, ko.table = ko.table)
+
+# Write KO tables for Xylose.
+generate_ko_table(module.table = xylose.upfinal, ko.table = ko.table)
+generate_ko_table(module.table = xylose.downfinal, ko.table = ko.table)
+
+# Write KO tables for GlucGent.
+generate_ko_table(module.table = glucgent.upfinal, ko.table = ko.table)
+generate_ko_table(module.table = glucgent.downfinal, ko.table = ko.table)
+
+# Write KO tables for Xylan.
+generate_ko_table(module.table = xylan.upfinal, ko.table = ko.table)
+generate_ko_table(module.table = xylan.downfinal, ko.table = ko.table)
+
+# Write KO tables for Pectin.
+generate_ko_table(module.table = pectin.upfinal, ko.table = ko.table)
+generate_ko_table(module.table = pectin.downfinal, ko.table = ko.table)
+
+
+```
+
+
+# 6.4) Making a relative abundance plot for the KEGG Categories and Subcategories.
+
+```{r 6.4-kegg-phyloseq-object, fig.height = 5, fig.width = 5}
+
+################################################################################################################
+### Making a phyloseq object incorporating the KEGG category/subcategory information as the taxonomic ranks. ###
+################################################################################################################
+
+# We generated the object 'category.table', which contains the KEGG Category and Subcategory information.
+# We also have a table for the RNA-Seq counts in the dds object. We want to marry these two items.
+kegg.dds <- as.data.frame(counts(dds, normalized = TRUE))
+category.table$GeneID <- as.character(category.table$GeneID)
+kegg.dds <- kegg.dds[category.table$GeneID,]
+kegg.dds2 <- kegg.dds[rowSums(is.na(kegg.dds))<ncol(kegg.dds),] # Removing NA's.
+
+
+# We want to divide by the div factor.
+df.divfactor <- data.frame(div_factor = category.table$div_factor)
+df.divfactor <- cbind(df.divfactor, replicate(14, df.divfactor$div_factor))
+rownames(df.divfactor) <- rownames(kegg.dds)
+df.divfactor <- df.divfactor[rownames(kegg.dds2),]
+
+# Divide the kegg.dds object by the div factor.
+kegg.dds3 <- kegg.dds2 / df.divfactor
+kegg.dds3 <- round(kegg.dds3, digits = 0)
+
+# Make this into a otu_table object phyloseq can use.
+kegg.dds.otu <- otu_table(kegg.dds3, taxa_are_rows = TRUE)
+# View(data.frame(kegg.dds.otu))
+
+# Make the category table into a tax_table object phyloseq can use.
+category.table2 <- dplyr::select(category.table, KEGG_Category, KEGG_Subcategory, GeneID)
+rownames(category.table2) <- rownames(kegg.dds)
+category.table3 <- category.table2[rownames(kegg.dds2),]
+
+kegg.dds.tax <- tax_table(category.table3)
+taxa_names(kegg.dds.tax) <- rownames(kegg.dds3)
+colnames(kegg.dds.tax) <- c("KEGG_Category", "KEGG_Subcategory", "GeneID")
+
+# Make the sample info.
+kegg.dds.sample <- sample_data(condition_info)
+
+# Merge these to make a phyloseq object.
+kegg.phy <- merge_phyloseq(kegg.dds.otu, kegg.dds.tax, kegg.dds.sample)
+
+```
+
+```{r kegg-melt-object, fig.height = 10, fig.width = 8}
+
+relabundance_melttable <- function(phy, n = 10, rank = "Phylum"){
+  
+  # Replace spaces with underscores to avoid screwing things up later.
+  tax_table(phy)[,rank] <- gsub(" ", "_", tax_table(phy)[,rank]) 
+  
+  # Determine what the top n phyla are. Doing 'n+1' in order to capture the unknown ('?') phylum.
+  top_taxa <- as.list(sort(tapply(taxa_sums(phy), tax_table(phy)[,rank], sum), TRUE)[1:(n+1)]) %>% names()
+ 
+  # If one of the top_taxa is unknown, we want to remove it from this list.
+  top_taxa <- top_taxa[top_taxa != "\\?"]
+  
+  # If not, we want to remove the extra element so we only have n elements in this list.
+  if(length(top_taxa) > n){
+    top_taxa <- top_taxa[1:(length(top_taxa) - 1)]
+  }
+  print(top_taxa)
+  
+  # Rename the taxa that aren't in the top n to just be "Other".
+  tax_table(phy)[!tax_table(phy)[,rank] %in% top_taxa,rank] <- "Other"
+  
+  tax_table(phy)[,rank] <- factor(tax_table(phy)[,rank], levels = c(top_taxa, "Other")) %>% as.character()
+
+  # In order for us to glom successfully, we need to remove the columns prior to the taxrank we're using. E.g. if using 'Class',
+  # we need to remove 'Domain' and 'Phylum'.
+  tax_table(phy) <- tax_table(phy)[,which(colnames(tax_table(phy)) == rank):length(colnames(tax_table(phy)))]
+  
+  phy.glom <- tax_glom(phy, taxrank = rank)
+  taxa_names(phy.glom) <- tax_table(phy.glom)[,rank]
+  
+  
+  if(taxa_are_rows(phy.glom) == TRUE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), data.frame(t(otu_table(phy.glom))))
+  }
+  
+  if(taxa_are_rows(phy.glom) == FALSE){
+    glom.table <- cbind(data.frame(sample_data(phy.glom)), data.frame(otu_table(phy.glom)))
+  }
+  
+  if("Replicate" %in% colnames(glom.table)){
+    glom.table$Replicate <- as.character(glom.table$Replicate)
+  }
+  
+  glom.melt <- melt(data = glom.table, value.name = "Abundance", variable.name = rank)
+
+  # # Relevel the taxrank so 'Other' is last.
+  # glom.melt[,rank] <- factor(glom.melt[,rank], levels = c(sort(top_taxa), "Other"))
+  # 
+  # print(length(unique(glom.melt[,rank])))
+  
+  # # Remove any NAs.
+  # glom.melt <- glom.melt[!is.na(glom.melt[,rank]),]
+  # 
+  # # If the taxa is labeled with a prefix (e.g. p__Proteobacteria rather than Proteobacteria),
+  # # we can get rid of that here.
+  # glom.melt[,rank] <- gsub("^.__", "", glom.melt[,rank])
+   
+  # Replace underscores with spaces.
+  glom.melt[,rank] <- gsub("_", " ", glom.melt[,rank])
+  
+  print(length(unique(glom.melt[,rank])))
+  
+  return(glom.melt)
+}
+
+kegg.cat.melt <- relabundance_melttable(kegg.phy, n = 20, rank = "KEGG_Category")
+
+kegg.subcat.melt <- relabundance_melttable(kegg.phy, n = 30, rank = "KEGG_Subcategory")
+
+# Modify the dataframes as necessary to generate the figures.
+kegg.cat.melt$Replicate <- c("4","7","8","2","3","4","2","3","4","11","13","15","3","4","8")
+kegg.subcat.melt$Replicate <- c("4","7","8","2","3","4","2","3","4","11","13","15","3","4","8")
+kegg.cat.melt$condition <- factor(kegg.cat.melt$condition, levels = c("NAG", "Xylose", "GlucGent", "Xylan", "Pectin"))
+kegg.subcat.melt$condition <- factor(kegg.subcat.melt$condition, levels = c("NAG", "Xylose", "GlucGent", "Xylan", "Pectin"))
+
+category_levels <- kegg.cat.melt$KEGG_Category[!kegg.cat.melt$KEGG_Category %in% c("Other")] %>% unique() %>% sort()
+category_levels <- c(category_levels, "Other")
+
+subcategory_levels <- kegg.subcat.melt$KEGG_Subcategory[!kegg.subcat.melt$KEGG_Subcategory %in% c("Other")] %>% unique() %>% sort()
+subcategory_levels <- c(subcategory_levels, "Other")
+
+kegg.cat.melt$KEGG_Category <- factor(kegg.cat.melt$KEGG_Category, levels = category_levels)
+kegg.subcat.melt$KEGG_Subcategory <- factor(kegg.subcat.melt$KEGG_Subcategory, levels = subcategory_levels)
+
+###########################################
+### Making a plot of the melted object. ###
+###########################################
+
+category_plot <- ggplot(data=kegg.cat.melt,aes(x=Replicate,y=Abundance,fill=KEGG_Category)) + 
+  geom_bar(stat="identity", position = "fill") + 
+  facet_wrap( ~ condition, scales = "free_x", nrow=1) +
+  # scale_fill_manual(values = c25) +
+  scale_fill_manual(values = rev(c(brewer.pal(10,"Spectral"), viridis(5), rev(magma(5)), "grey34")), drop = FALSE) +
+  # scale_fill_manual(values = c(col, "grey34"), drop = FALSE) +
+  theme(axis.text.x=element_text(size=16,color="black"), axis.text.y=element_text(size=24,color="black"),
+        axis.title.y=element_text(size=24,face="bold"), axis.title.x = element_blank(), text=element_text(size=24)) +
+  ggtitle("Abundance Trends for KEGG Categories across Samples") + ylab("Category-Level Relative Abundance\n") +
+  theme(legend.text = element_text(size = 18), plot.title = element_blank()) + theme(panel.spacing = unit(1, "lines")) +
+  guides(fill = guide_legend(ncol = 1))
+
+# category_plot
+
+subcategory_plot <- ggplot(data=kegg.subcat.melt,aes(x=Replicate,y=Abundance,fill=KEGG_Subcategory)) + 
+  geom_bar(stat="identity", position = "fill") + 
+  facet_wrap( ~ condition, scales = "free_x", nrow=1) +
+  # scale_fill_manual(values = c25) +
+  scale_fill_manual(values = (c(brewer.pal(10,"Spectral"), viridis(10), rev(magma(10)), "gray34")), drop = FALSE) +
+  # scale_fill_manual(values = c(col, "grey34"), drop = FALSE) +
+  theme(axis.text.x=element_text(size=16,color="black"), axis.text.y=element_text(size=24,color="black"),
+        axis.title.y=element_text(size=24,face="bold"), axis.title.x = element_text(size = 20, face = "bold"), text=element_text(size=24)) +
+  ggtitle("Abundance Trends for KEGG Subcategories across Samples") + ylab("Subcategory-Level Relative Abundance\n") + xlab("\nReplicate") +
+  theme(legend.text = element_text(size = 18), plot.title = element_text(color = "white")) + theme(panel.spacing = unit(1, "lines")) +
+  guides(fill = guide_legend(ncol = 1))
+
+# subcategory_plot
+
+
+###########################
+## Supplemental Figure 4 ##
+###########################
+
+
+full_plot <- plot_grid(category_plot, subcategory_plot, nrow = 2, labels = c("a)", "b)"), label_size = 24, rel_heights = c(0.95, 1.05))
+
+full_plot
+
+# save_plot("../../../2019_07_31_danfunctionalmodules_OTUs/111119_draft2/final_figures/SupplementalFigure_4.pdf", plot = full_plot, ncol = 1,
+#           base_width = 18, base_height = 15, scale = 1.25)
+ 
+
+```
+
